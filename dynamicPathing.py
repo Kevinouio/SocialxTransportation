@@ -1,4 +1,5 @@
 import traci
+import huggingface
 from assign.costFunctionChecker import generateWeights
 
 import socialNetwork

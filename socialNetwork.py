@@ -38,7 +38,13 @@ def createWeights():
         CarWeights.append(iterWeights)
 
     return CarWeights
+
+
 def generateVisualGraphOfWeights(model,iterations):
 
     viz = OpinionEvolution(model, iterations)
     viz.plot("opinion_ev.pdf")
+
+if __name__ == "__main__":
+    model, iterations = createWeights()
+    generateVisualGraphOfWeights()
