@@ -4,8 +4,8 @@ import ndlib.models.opinions as op
 from ndlib.viz.mpl.OpinionEvolution import OpinionEvolution
 
 #
-def createWeights():
-    g = nx.complete_graph(50)
+def createWeights(carTotal,time):
+    g = nx.complete_graph(carTotal)
 
     # Algorithmic Bias model
     model = op.AlgorithmicBiasModel(g)
@@ -17,7 +17,7 @@ def createWeights():
     model.set_initial_status(config)
 
     # Simulation execution
-    iterations = model.iteration_bunch(20) # Reduced iterations for brevity
+    iterations = model.iteration_bunch(time) # Reduced iterations for brevity
 
     # Store opinions in a list of dictionaries
     opinion_history = []
@@ -37,7 +37,9 @@ def createWeights():
             iterWeights.append(weights[i])
         CarWeights.append(iterWeights)
 
-    return CarWeights
+
+
+    return model, iterations, CarWeights
 
 
 def generateVisualGraphOfWeights(model,iterations):
@@ -46,5 +48,5 @@ def generateVisualGraphOfWeights(model,iterations):
     viz.plot("opinion_ev.pdf")
 
 if __name__ == "__main__":
-    model, iterations = createWeights()
-    generateVisualGraphOfWeights()
+    model, iterations, CarWeights = createWeights()
+    generateVisualGraphOfWeights(model,iterations)

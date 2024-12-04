@@ -1,5 +1,5 @@
 import traci
-import huggingface
+
 from assign.costFunctionChecker import generateWeights
 
 import socialNetwork
@@ -58,5 +58,5 @@ totalTime = 20000     # Seconds
 
 # Gets a list of the nodes of the cars that are within the
 
-weightsPerIteration = createWeights()
+model,iterations, CarWeights = createWeights(100,100)
 
