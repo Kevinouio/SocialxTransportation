@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 # Functions for Social Network Influence
 def initialize_social_network(car_total):
     g = nx.complete_graph(car_total)

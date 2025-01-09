@@ -2,7 +2,9 @@ import requests
 
 # Server Configuration
 SERVER_IP = "http://130.18.208.34:5000"
- # Replace 'your-server-ip' with the actual IP or domain.
+
+
+# Replace 'your-server-ip' with the actual IP or domain.
 
 # Initialize the social network
 def initialize_social_network_on_server(car_total):
@@ -14,6 +16,7 @@ def initialize_social_network_on_server(car_total):
             print("Failed to initialize social network:", response.text)
     except requests.exceptions.RequestException as e:
         print("Error while trying to connect to the server:", e)
+
 
 # Propagate the rumor
 def propagate_rumor_on_server(rumor, steps=1):
@@ -27,6 +30,7 @@ def propagate_rumor_on_server(rumor, steps=1):
     except requests.exceptions.RequestException as e:
         print("Error while trying to connect to the server:", e)
     return {}
+
 
 # Example Usage
 if __name__ == "__main__":
