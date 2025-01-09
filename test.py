@@ -1,28 +1,47 @@
-import xml.etree.ElementTree as ET
+import requests
 
-def get_edge_to_street_mapping(osm_file="osm.net.xml"):
-    # Parse the XML file
-    tree = ET.parse(osm_file)
-    root = tree.getroot()
+# Server Configuration
+SERVER_IP = "http://130.18.208.34:5000"
+ # Replace 'your-server-ip' with the actual IP or domain.
 
-    # Initialize dictionaries to store mapping
-    edge_to_street = {}
-    street_names = set()  # Use a set to avoid duplicate street names
+# Initialize the social network
+def initialize_social_network_on_server(car_total):
+    try:
+        response = requests.post(f"{SERVER_IP}/initialize", json={"car_total": car_total})
+        if response.status_code == 200:
+            print("Social network initialized:", response.json())
+        else:
+            print("Failed to initialize social network:", response.text)
+    except requests.exceptions.RequestException as e:
+        print("Error while trying to connect to the server:", e)
 
-    # Iterate over all <edge> elements in the XML
-    for edge in root.findall("edge"):
-        edge_id = edge.get("id")  # Get the edge ID
-        street_name = edge.get("name")  # Get the name attribute
+# Propagate the rumor
+def propagate_rumor_on_server(rumor, steps=1):
+    try:
+        response = requests.post(f"{SERVER_IP}/propagate", json={"rumor": rumor, "steps": steps})
+        if response.status_code == 200:
+            print("Rumor propagated successfully.")
+            return response.json()  # Returns the statuses
+        else:
+            print("Failed to propagate rumor:", response.text)
+    except requests.exceptions.RequestException as e:
+        print("Error while trying to connect to the server:", e)
+    return {}
 
-        if street_name:  # Only consider edges with a valid name
-            edge_to_street[edge_id] = street_name
-            street_names.add(street_name)
-
-    # Convert street_names back to a sorted list
-    return edge_to_street, sorted(street_names)
-
+# Example Usage
 if __name__ == "__main__":
-    # Test the function
-    edge_to_street, street_names = get_edge_to_street_mapping("osm.net.xml")
-    print(f"Edge to Street Mapping: {edge_to_street}")
-    print(f"List of Street Names: {street_names}")
+    # Number of nodes (cars) in the social network
+    car_total = 3000
+
+    # Initialize the social network on the server
+    initialize_social_network_on_server(car_total)
+
+    # Propagate a rumor
+    rumor = "Active shooter on Main Street"
+    statuses = propagate_rumor_on_server(rumor, steps=1)
+
+    # Print the returned statuses
+    if statuses:
+        print("Node statuses:", statuses)
+    else:
+        print("No statuses received.")
