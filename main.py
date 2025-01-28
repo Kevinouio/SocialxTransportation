@@ -1,26 +1,17 @@
 import traci
 import networkx as nx
-import ndlib.models.ModelConfig as mc
-import ndlib.models.opinions as op
 from transformers import pipeline
+import ndlib.models.ModelConfig as mc
+import ndlib.models.epidemics as ep
 import xml.etree.ElementTree as ET
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import random
+import os
+import socialNetwork as sn
 
-
-# Functions for Social Network Influence
-def initialize_social_network(car_total):
-    g = nx.complete_graph(car_total)
-    # Algorithmic Bias model
-    model = op.AlgorithmicBiasModel(g)
-
-    # Model configuration
-    config = mc.Configuration()
-    config.add_model_parameter("epsilon", 0.32)
-    config.add_model_parameter("gamma", 0)
-    model.set_initial_status(config)
-
-    return model
 
 
 def get_street_names_from_network(network_file):
@@ -76,31 +67,15 @@ def propagate_rumor(model, rumor):
     return statuses
 
 
-# Visualize the social network and rumor propagation
-def visualize_social_network(car_total, statuses=None):
-    _, g = initialize_social_network(car_total)
-
-    # Node colors based on statuses
-    node_colors = []
-    if statuses:
-        for node in g.nodes():
-            # Color code: 1 = Believes rumor, 0 = Doesn't believe rumor
-            node_colors.append("red" if statuses.get(node, 0) >= 0.5 else "blue")
-    else:
-        node_colors = ["blue"] * len(g.nodes())  # Default color for all nodes
-
-    # Plot the graph
-    plt.figure(figsize=(10, 8))
-    pos = nx.spring_layout(g)  # Position for a spring layout
-    nx.draw(g, pos, node_color=node_colors, with_labels=True, node_size=500, edge_color="gray")
-    plt.title("Social Network Visualization with Rumor Propagation")
-    plt.show()
-
-
-# Functions for LLM-based Rumor Evaluation
 def evaluate_rumor_with_llm(rumor, street_names):
-    from transformers import pipeline
-
+    """
+    Evaluates a rumor prompt with LLMs for sentiment and street classification.
+    Args:
+        rumor (str): The rumor prompt to evaluate.
+        street_names (list): A list of street names for classification.
+    Returns:
+        tuple: Overall sentiment and relevant streets.
+    """
     # Initialize pipelines
     sentiment_pipe = pipeline(
         "text-classification", model="cardiffnlp/twitter-roberta-base-sentiment-latest", return_all_scores=True
@@ -110,11 +85,11 @@ def evaluate_rumor_with_llm(rumor, street_names):
     )
 
     # Get sentiment analysis results
-    sentiment_scores = sentiment_pipe(rumor)[0]  # Returns a list of dictionaries with scores for each label
+    sentiment_scores = sentiment_pipe(rumor)[0]
     sentiment_results = {entry["label"]: entry["score"] for entry in sentiment_scores}
 
     # Determine overall sentiment
-    if sentiment_results.get("negative", 0) > 0.40:
+    if sentiment_results.get("negative", 0) > 0.35:
         overall_sentiment = "negative"
     else:
         overall_sentiment = "neutral"
@@ -125,28 +100,53 @@ def evaluate_rumor_with_llm(rumor, street_names):
         street for street, score in zip(classification_result["labels"], classification_result["scores"]) if score > 0.5
     ]
 
-    # Print results for debugging
     print(f"Relevant Streets: {relevant_streets}")
     print(f"Sentiment Results: {sentiment_results}")
     print(f"Overall Sentiment: {overall_sentiment}")
 
     return overall_sentiment, relevant_streets
 
+def generate_prompts_based_on_cars(cartotal, street_names):
+    """
+    Generates prompts based on the total number of cars.
+    Args:
+        cartotal (int): The total number of cars in the simulation.
+        street_names (list): A list of street names.
+    Returns:
+        list: A list of generated prompts.
+    """
+    num_prompts = max(1, cartotal // 3)  # Ensure at least one prompt is generated
+    prompts = []
+
+    for _ in range(num_prompts):
+        event_type = random.choice(["active shooter", "traffic jam"])
+        street = random.choice(street_names)
+        prompts.append(f"There is a {event_type} at {street}.")
+
+    return prompts
 
 # Dynamic Pathing Function
-def reroute_vehicle(vehicle_id, danger_levels, social_network_status):
+def reroute_vehicle(vehicle_id, danger_levels, social_network_status, vehicle_to_node):
     """
-    Reroutes a vehicle based on its awareness of a rumor and the danger levels of streets.
+    Reroutes a vehicle based on its respective social network node and danger levels.
 
     Args:
         vehicle_id (str): The ID of the vehicle to be rerouted.
         danger_levels (dict): Dictionary mapping street names to danger levels.
-        social_network_status (dict): Dictionary mapping vehicle IDs to rumor awareness levels (0 to 1).
+        social_network_status (dict): Dictionary mapping social network nodes to rumor awareness levels.
+        vehicle_to_node (dict): Mapping of vehicle IDs to social network nodes.
     """
-    # Check if the vehicle "heard the rumor"
-    if social_network_status.get(vehicle_id, 0) < 0.5:
-        # If the vehicle has not "heard the rumor," do not reroute
-        print("Did Not Hear Rumor")
+    # Get the social network node for this vehicle
+    node_id = vehicle_to_node.get(vehicle_id)
+    if node_id is None:
+        print(f"Vehicle {vehicle_id} has no assigned social network node.")
+        return
+
+    # Check if the vehicle "heard the rumor" through its node
+    node_status = social_network_status.get(node_id, 0)
+    if node_status < 0.5:
+        # If the vehicle's node is not significantly affected by the rumor, do not reroute
+        print(f"Vehicle {vehicle_id} did not hear the rumor through node {node_id}.")
         return
 
     # Get the current edge of the vehicle
@@ -180,8 +180,7 @@ def reroute_vehicle(vehicle_id, danger_levels, social_network_status):
         route_to_best_edge = traci.simulation.findRoute(current_edge, best_edge).edges
         traci.vehicle.setRoute(vehicle_id, route_to_best_edge)
 
-
-# Main Simulation
+#Main simulation
 def main():
     # Paths to the .net.xml and .rou.xml files
     network_file = "osm.net.xml"  # Path to your network file
@@ -191,57 +190,87 @@ def main():
     car_total = count_vehicles_in_route_file(route_file)
     print(f"Total number of vehicles in the route file: {car_total}")
 
-    # Initialize the social network model for rumor propagation
-    social_model = initialize_social_network(car_total)
-
     # Parse edge-to-street mapping and initialize danger levels
     edge_to_street, street_names, danger_levels = get_edge_to_street_mapping(network_file)
+
+    # Initialize dictionary to track street crossings
+    street_crossings = {edge: 0 for edge in edge_to_street.keys()}
+
+    # Mapping of vehicles to social network nodes
+    vehicle_to_node = {}
+
+    # Generates the prompts that will be injected into the simulation
+    prompts = generate_prompts_based_on_cars(car_total, street_names)
 
     # Start the SUMO simulation
     traci.start(["sumo-gui", "-n", network_file, "-r", route_file])
 
-    # Initialize tick counter
+    # Initialize variables
     tick_counter = -1
+    rumor_list = []  # List to store rumors
+    social_networks = []  # List to store social network objects
+
     try:
         while traci.simulation.getMinExpectedNumber() > 0:
             # Advance simulation step
             traci.simulationStep()
             tick_counter += 1
-            if tick_counter == 0:
-                # Prompt for a rumor input
-                rumor = input("Enter a rumor about a street (or type 'skip'): ")
-                if rumor.lower() == "skip":
-                    continue
 
-                # Evaluate the rumor using LLMs
-                sentiment, street_info = evaluate_rumor_with_llm(rumor, street_names)
-                print(f"Sentiment: {sentiment}")
-                print(f"Street Info: {street_info}")
+            # Update street crossing counts
+            for edge in street_crossings.keys():
+                street_crossings[edge] += traci.edge.getLastStepVehicleNumber(edge)
 
-                # Extract relevant streets from the street_info
-                # Since street_info is a list of strings
-                relevant_streets = [info.strip() for info in street_info if info.strip() in street_names]
+                # Track the order of car generation and assign to social network nodes
+                departed_vehicles = traci.simulation.getDepartedIDList()
+                for vehicle_id in departed_vehicles:
+                    # Assign vehicle to a social network node (e.g., round-robin or random)
+                    assigned_node = len(vehicle_to_node) % car_total  # Example: round-robin assignment
+                    vehicle_to_node[vehicle_id] = assigned_node
 
-                print(f"Relevant Streets Identified: {relevant_streets}")
+            '''
+            # Inject rumors every 50 seconds with 20% probability
+            if tick_counter > 0 and tick_counter % 50 == 0:
+                if random.random() <= 0.2:
+                    # Generate a new social network model for the rumor
+                    social_network = sn.SocialNetwork(node_count=car_total, recovery_delay=10, rumor_count=len(rumor_list) + 1)
 
-                # Update danger levels for relevant streets
-                for street in relevant_streets:
-                    danger_levels[street] = 1  # Mark relevant streets as dangerous
-                    print(f"Updated danger level for {street} to 1")
-                # Example social network status for vehicles (REMEMBER TO CHANGE THIS BACK)
-                for i in range(20):
-                    social_network_status = propagate_rumor(social_model, rumor)
-                visualize_social_network(car_total, social_network_status)
+                    # Generate a rumor input and add to the list
+                    rumor = input("Enter a rumor about a street (or type 'skip'): ")
+                    if rumor.lower() != "skip":
+                        rumor_list.append(rumor)
+                        social_networks.append(social_network)
+                        print(f"Rumor {len(rumor_list)} added: {rumor}")
 
+            # Run a timestep for each social network every 50 seconds
+            if tick_counter > 0 and tick_counter % 50 == 0:
+                for idx, social_network in enumerate(social_networks):
+                    print(f"Running timestep for Rumor {idx + 1}")
+                    social_network.run_time_step()
+                    social_network.visualize()
+            '''
             # Update vehicle routing
             for vehicle_id in traci.vehicle.getIDList():
-                reroute_vehicle(vehicle_id, danger_levels, social_network_status)
+                reroute_vehicle(vehicle_id, danger_levels, {}, vehicle_to_node)
 
 
     finally:
+        # Print street crossing statistics
+        print("Street Crossing Statistics:")
+        for edge, count in street_crossings.items():
+            street_name = edge_to_street.get(edge, "Unknown Street")
+            print(f"{street_name} ({edge}): {count} crossings")
+
+        # Optionally, save statistics to a file
+        with open("street_crossings.txt", "w") as f:
+            for edge, count in street_crossings.items():
+                street_name = edge_to_street.get(edge, "Unknown Street")
+                f.write(f"{street_name} ({edge}): {count} crossings\n")
+
         # Close the SUMO simulation
         traci.close()
         print("Simulation ended.")
+
+
 
 
 if __name__ == "__main__":
