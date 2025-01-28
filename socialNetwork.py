@@ -1,104 +1,117 @@
 import networkx as nx
 import matplotlib
 import random
+import os
 
-matplotlib.use('TkAgg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
-# Function to initialize the social network with custom SIR model
-def initialize_social_network_sir(node_count):
-    g = nx.complete_graph(node_count)
+class SocialNetwork:
+    def __init__(self, node_count, recovery_delay, rumor_count=1):
+        self.graph = nx.complete_graph(node_count)
+        self.node_count = node_count
+        self.recovery_delay = recovery_delay
+        self.rumor_count = rumor_count
+        self.current_step = 0
+        self.recovery_started = False
 
-    # Initialize node states: 0 = Susceptible, 1 = Infected, 2 = Recovered
-    status = {node: 0 for node in g.nodes()}
-    infection_time = {node: None for node in g.nodes()}  # Track infection times
-    initial_infected = random.choice(list(g.nodes()))
-    status[initial_infected] = 1  # Start with one infected node
-    infection_time[initial_infected] = 0  # Infection starts at step 0
+        # Initialize node states: 0 = Susceptible, 1 = Infected, 2 = Recovered
+        self.status = {node: 0 for node in self.graph.nodes()}
+        self.infection_time = {node: None for node in self.graph.nodes()}
 
-    return g, status, infection_time
+        # Infect one random node
+        initial_infected = random.choice(list(self.graph.nodes()))
+        self.status[initial_infected] = 1
+        self.infection_time[initial_infected] = 0
+
+    def run_time_step(self):
+        """
+        Execute a single time step of the simulation.
+        """
+        new_status = self.status.copy()
+
+        # Spread infection
+        for node in self.graph.nodes():
+            if self.status[node] == 1:  # Infected node
+                for neighbor in self.graph.neighbors(node):
+                    if self.status[neighbor] == 0 and random.random() < 0.05:  # Infection probability
+                        new_status[neighbor] = 1
+                        if self.infection_time[neighbor] is None:
+                            self.infection_time[neighbor] = self.current_step
+
+        # Check if recovery can start
+        if not self.recovery_started and all(s == 1 for s in self.status.values()):
+            print("All nodes infected. Recovery now possible.")
+            self.recovery_started = True
+
+        # Manage recovery
+        for node in self.graph.nodes():
+            if self.status[node] == 1 and self.infection_time[node] is not None:
+                if self.current_step - self.infection_time[node] >= self.recovery_delay:
+                    new_status[node] = 2  # Recovered
+
+        self.status = new_status
+        self.current_step += 1
+
+    def visualize(self):
+        """
+        Save the current state of the social network as an image.
+        """
+        status_colors = {0: "blue", 1: "red", 2: "green"}
+        pos = nx.spring_layout(self.graph, k=2)  # Adjust 'k' for spacing
+        node_colors = [status_colors[self.status[node]] for node in self.graph.nodes()]
+
+        output_folder = "SocialNet"
+        os.makedirs(output_folder, exist_ok=True)
+
+        save_path = os.path.join(output_folder, f"Rumor{self.rumor_count}_TimeStep{self.current_step}.png")
+
+        plt.figure(figsize=(16, 9))
+        plt.clf()
+        nx.draw(
+            self.graph,
+            pos,
+            node_color=node_colors,
+            with_labels=True,
+            node_size=50,
+            edge_color="gray",
+            width=0
+        )
+        plt.title(f"Social Network - Rumor {self.rumor_count}, Step {self.current_step}")
+        plt.savefig(save_path)
+        plt.close()
+
+    def is_simulation_complete(self):
+        """
+        Check if the simulation is complete (no infected nodes left).
+        """
+        return all(s != 1 for s in self.status.values())
 
 
-# Function to execute a single time step
-def single_time_step(graph, status, infection_time, current_step, recovery_delay, recovery_started):
-    new_status = status.copy()
-
-    # Infection spread
-    for node in graph.nodes():
-        if status[node] == 1:  # Infected node
-            for neighbor in graph.neighbors(node):
-                if status[neighbor] == 0 and random.random() < 0.05:  # Infection probability
-                    new_status[neighbor] = 1
-                    if infection_time[neighbor] is None:
-                        infection_time[neighbor] = current_step  # Record infection time
-
-    # Check if recovery can start
-    if not recovery_started and all(s == 1 for s in status.values()):
-        print("All nodes infected. Recovery now possible.")
-        recovery_started = True
-
-    # Recovery management
-    for node in graph.nodes():
-        if status[node] == 1 and infection_time[node] is not None:
-            # Check if the recovery delay has passed since infection
-            if current_step - infection_time[node] >= recovery_delay:
-                new_status[node] = 2  # Recovered
-
-    return new_status, recovery_started
-
-
-# Visualization function
-def visualize_sir(graph, status):
-    status_colors = {0: "blue", 1: "red", 2: "green"}  # Susceptible, Infected, Removed
-    pos = nx.spring_layout(graph)  # Position for visualization
-    node_colors = [status_colors[status[node]] for node in graph.nodes()]
-
-    plt.clf()
-    nx.draw(
-        graph,
-        pos,
-        node_color=node_colors,
-        with_labels=True,
-        node_size=50,
-        edge_color="gray"
-    )
-    plt.title("SIR Model - Current Step")
-    plt.draw()
-    plt.pause(0.1)  # Pause for visualization
-
-
-# Main function to interactively run the simulation
+# Main function to interactively run multiple simulations
 def main():
-    node_count = 100  # Number of nodes
-    recovery_delay = 10  # Time steps before recovery after infection
-    social_graph, node_status, infection_time = initialize_social_network_sir(node_count)
+    networks = []  # List to hold multiple social networks
+    num_networks = 2  # Number of networks to simulate
 
-    recovery_started = False
-    current_step = 0
-
-    # Visualization setup
-    plt.ion()
+    # Initialize multiple networks
+    for i in range(num_networks):
+        networks.append(SocialNetwork(node_count=300, recovery_delay=10, rumor_count=i + 1))
 
     while True:
-        print(f"Step: {current_step}")
-        visualize_sir(social_graph, node_status)
+        all_complete = True
+        for network in networks:
+            if not network.is_simulation_complete():
+                print(f"Running step {network.current_step} for Rumor {network.rumor_count}")
+                network.run_time_step()
+                network.visualize()
+                all_complete = False
 
-        # Execute a single time step
-        node_status, recovery_started = single_time_step(
-            social_graph, node_status, infection_time, current_step, recovery_delay, recovery_started
-        )
-
-        # Check if the simulation is complete
-        if all(s != 1 for s in node_status.values()):
-            print("Simulation complete. No more infected nodes.")
+        if all_complete:
+            print("All simulations complete.")
             break
 
-        current_step += 1
         input("Press Enter to proceed to the next step...")
-
-    plt.ioff()
-    plt.show()
 
 
 if __name__ == "__main__":
