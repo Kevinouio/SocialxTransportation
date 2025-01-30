@@ -3,48 +3,59 @@ import random
 from collections import defaultdict
 
 
-def reroute_vehicle_before_danger(vehicle_id, danger_street):
+import random
+import traci
+
+def reroute_vehicle_with_multiple_rumors(vehicle_id, social_models, vehicle_to_node):
     """
-    Reroutes the vehicle if the next edge in its route is a dangerous street.
+    Reroutes a vehicle if its corresponding node in the social network is infected in any of the active rumors.
     Args:
         vehicle_id (str): The ID of the vehicle to be rerouted.
-        danger_street (str): The ID of the street (edge) to be avoided.
+        social_models (list): List of SocialNetwork objects, each containing an associated dangerous street edge.
+        vehicle_to_node (dict): Mapping of vehicle IDs to their corresponding social network nodes.
     """
-    # Get the current route and index
+    # Get the node associated with this vehicle
+    node_id = vehicle_to_node.get(vehicle_id)
+    if node_id is None:
+        print(f"Vehicle {vehicle_id} has no assigned node.")
+        return
+
+    # Collect all dangerous edges from infected rumors
+    dangerous_edges = set()
+    for social_model in social_models:
+        if social_model.status.get(node_id, 0) == 1:  # Node is infected in this rumor
+            dangerous_edges.add(social_model.related_edge)
+
+    # Skip rerouting if there are no active dangerous edges for this vehicle
+    if not dangerous_edges:
+        return
+
+    # Get the vehicle’s current route and index
     route = traci.vehicle.getRoute(vehicle_id)
     route_index = traci.vehicle.getRouteIndex(vehicle_id)
 
-    # Check if the danger street is in the next part of the route
-    if route_index + 1 < len(route) and route[route_index + 1] == danger_street:
-        # Get the current edge of the vehicle
+    # Check if the upcoming edge is dangerous
+    if route_index + 1 < len(route) and route[route_index + 1] in dangerous_edges:
         current_edge = traci.vehicle.getRoadID(vehicle_id)
 
         # Get all edges in the network
         all_edges = traci.edge.getIDList()
 
-        # Find potential outgoing edges
-        next_edges = [
+        # Find alternative outgoing edges that do not contain a dangerous edge
+        safe_edges = [
             edge for edge in all_edges
             if current_edge in traci.simulation.findRoute(current_edge, edge).edges
+            and all(dangerous_edge not in traci.simulation.findRoute(current_edge, edge).edges for dangerous_edge in dangerous_edges)
         ]
 
-        # Filter out routes that include the danger street
-        safe_edges = []
-        for edge in next_edges:
-            route_to_edge = traci.simulation.findRoute(current_edge, edge).edges
-            if danger_street not in route_to_edge:
-                safe_edges.append(edge)
-
-        # If there are safe edges, pick one randomly
+        # If there are safe edges, pick one randomly and reroute
         if safe_edges:
             new_edge = random.choice(safe_edges)
-            route_to_new_edge = traci.simulation.findRoute(current_edge, new_edge).edges
-            traci.vehicle.setRoute(vehicle_id, route_to_new_edge)
-            print(f"Vehicle {vehicle_id} rerouted to avoid {danger_street}. New route: {route_to_new_edge}")
+            new_route = traci.simulation.findRoute(current_edge, new_edge).edges
+            traci.vehicle.setRoute(vehicle_id, new_route)
+            print(f"Vehicle {vehicle_id} rerouted to avoid {dangerous_edges}. New route: {new_route}")
         else:
-            print(f"No safe routes found for vehicle {vehicle_id} to avoid {danger_street}.")
-    else:
-        print(f"Vehicle {vehicle_id} is not approaching the danger street {danger_street}, no rerouting needed.")
+            print(f"No safe alternative routes found for vehicle {vehicle_id} to avoid {dangerous_edges}.")
 
 
 def main():
