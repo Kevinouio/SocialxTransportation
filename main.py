@@ -10,6 +10,47 @@ import random
 import os
 import socialNetwork as sn
 
+import os
+import pandas as pd
+
+
+def update_street_statistics_csv(data, rumor_street, csv_filename="street_crossings.csv"):
+    """
+    Updates the CSV file with new street crossing statistics and appends the injected rumor street.
+
+    Args:
+        data (dict): A dictionary where keys are street names & edge IDs and values are crossing counts.
+        rumor_street (str): The street that was injected with a rumor.
+        csv_filename (str): Path to the CSV file.
+    """
+    # Check if the CSV file already exists
+    if os.path.exists(csv_filename):
+        # Load existing data
+        existing_df = pd.read_csv(csv_filename)
+        existing_columns = existing_df.columns.tolist()
+
+        # Determine new run column name
+        run_number = len(existing_columns)  # New run index (Run 1, Run 2, etc.)
+        new_run_col = f"Run {run_number}"
+
+        # Update existing DataFrame
+        new_data_df = pd.DataFrame({"Street Names & Edge IDs": list(data.keys()), new_run_col: list(data.values())})
+        merged_df = existing_df.merge(new_data_df, on="Street Names & Edge IDs", how="outer")
+
+    else:
+        # Create new DataFrame if file doesn't exist
+        merged_df = pd.DataFrame({"Street Names & Edge IDs": list(data.keys()), "Run 1": list(data.values())})
+
+    # Append the rumor street at the bottom
+    rumor_row = pd.DataFrame(
+        {"Street Names & Edge IDs": ["Rumor Injected"], f"Run {len(merged_df.columns) - 1}": rumor_street},
+        index=[len(merged_df)])
+    merged_df = pd.concat([merged_df, rumor_row], ignore_index=True)
+
+    # Save updated CSV
+    merged_df.to_csv(csv_filename, index=False)
+
+    return merged_df
 
 
 def get_street_names_from_network(network_file):
@@ -225,7 +266,13 @@ def main():
     vehicle_to_node = {}
 
     # Generates the prompts that will be injected into the simulation
-    prompts = generate_prompts_based_on_cars(car_total, street_names)
+    #prompts = generate_prompts_based_on_cars(car_total, street_names)
+    prompted = generate_prompts_based_on_cars(car_total, street_names)
+
+    prompts = []
+    for _ in range(2):
+        prompts.append(random.choice(prompted))
+
 
     # Start the SUMO simulation
     traci.start(["sumo-gui", "-n", network_file, "-r", route_file])
@@ -234,6 +281,7 @@ def main():
     tick_counter = -1
     rumor_list = []  # List to store rumors
     social_networks = []  # List to store social network objects
+    dangerous_edges = []  # List to store edge ids listed as dangerous
 
     try:
         while traci.simulation.getMinExpectedNumber() > 0:
@@ -254,7 +302,7 @@ def main():
                     # Log the assignment
                     print(f"Vehicle ID: {vehicle_id} -> Assigned Node ID: {assigned_node}")
 
-
+            '''
             # Inject rumors every 50 seconds with 20% probability
             if tick_counter > 0 and tick_counter % 50 == 0:
                 if random.random() <= 0.2:
@@ -263,14 +311,38 @@ def main():
                     # Generate a rumor input and add to the list
                     #rumor = input("Enter a rumor about a street (or type 'skip'): ")
                     rumor = random.choice(prompts)
+                    prompts.remove(rumor)
                     sentiment, street_name = evaluate_rumor_with_llm(rumor, street_names)
                     streetID = random.choice(street_to_edges[street_name[0]])
+                    dangerous_edges.append(streetID)
                     if sentiment=="negative":
                         # Generate a new social network model for the rumor
                         social_network = sn.SocialNetwork(node_count=car_total, recovery_delay=10, rumor_count=len(rumor_list) + 1, related_edge=streetID)
                         rumor_list.append(rumor)
                         social_networks.append(social_network)
                         print(f"Rumor {len(rumor_list)} added: {rumor}")
+            '''
+
+            # Inject two rumors in the first 100 seconds
+            if tick_counter > 0 and tick_counter % 50 == 0:
+                if len(prompts) != 0:
+
+
+                    # Generate a rumor input and add to the list
+                    # rumor = input("Enter a rumor about a street (or type 'skip'): ")
+                    rumor = random.choice(prompts)
+                    prompts.remove(rumor)
+                    sentiment, street_name = evaluate_rumor_with_llm(rumor, street_names)
+                    streetID = random.choice(street_to_edges[street_name[0]])
+                    dangerous_edges.append(streetID)
+                    if sentiment == "negative":
+                        # Generate a new social network model for the rumor
+                        social_network = sn.SocialNetwork(node_count=car_total, recovery_delay=10,
+                                                          rumor_count=len(rumor_list) + 1, related_edge=streetID)
+                        rumor_list.append(rumor)
+                        social_networks.append(social_network)
+                        print(f"Rumor {len(rumor_list)} added: {rumor}")
+
 
             # Run a timestep for each social network every 50 seconds
             if tick_counter > 0 and tick_counter % 100 == 0:
@@ -291,11 +363,18 @@ def main():
             street_name = edge_to_street.get(edge, "Unknown Street")
             print(f"{street_name} ({edge}): {count} crossings")
 
-        # Optionally, save statistics to a file
-        with open("street_crossings.txt", "w") as f:
-            for edge, count in street_crossings.items():
-                street_name = edge_to_street.get(edge, "Unknown Street")
-                f.write(f"{street_name} ({edge}): {count} crossings\n")
+        # Update CSV with new run statistics
+        csv_filename = "street_crossings.csv"
+
+        # Convert statistics to a dictionary format
+        street_stats = {f"{street_name} ({edge})": count for edge, count in street_crossings.items()}
+
+        # Add rumor-injected street (modify this variable to hold the actual street name)
+        rumor_street = str(dangerous_edges)  # Replace with actual street name where rumor was injected
+
+        update_street_statistics_csv(street_stats, rumor_street, csv_filename)
+
+        print(f"Street statistics updated and saved to {csv_filename}")
 
         # Close the SUMO simulation
         traci.close()
