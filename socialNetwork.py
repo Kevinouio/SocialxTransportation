@@ -8,12 +8,13 @@ import matplotlib.pyplot as plt
 
 
 class SocialNetwork:
-    def __init__(self, node_count, recovery_delay, rumor_count=1):
+    def __init__(self, node_count, recovery_delay, rumor_count=1, related_edge=""):
         self.graph = nx.complete_graph(node_count)
         self.node_count = node_count
         self.recovery_delay = recovery_delay
         self.rumor_count = rumor_count
         self.current_step = 0
+        self.related_edge = related_edge
         self.recovery_started = False
 
         # Initialize node states: 0 = Susceptible, 1 = Infected, 2 = Recovered
