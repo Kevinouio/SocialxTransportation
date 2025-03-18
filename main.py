@@ -23,9 +23,9 @@ def main():
     # -------------------------------
     # Traffic Simulation Setup
     # -------------------------------
-    traffic_network_file = "new_network.net.xml"  # SUMO network for traffic simulation
+    traffic_network_file = "osm.net.xml"  # SUMO network for traffic simulation
     route_file = "osm.rou.xml"
-    poly_file = "osm.poly.xml"  # background polygons, if needed
+    #poly_file = "osm.poly.xml"  # background polygons, if needed
 
     car_total = count_vehicles_in_route_file(route_file)
     print(f"Total number of vehicles: {car_total}")
@@ -35,7 +35,7 @@ def main():
     street_crossings = {edge: 0 for edge in edge_to_street.keys()}
 
     # Start the SUMO traffic simulation
-    traci.start(["sumo-gui", "-n", traffic_network_file, "-r", route_file, "-a", poly_file])
+    traci.start(["sumo-gui", "-n", traffic_network_file, "-r", route_file])
 
     # -------------------------------
     # Power Network Simulation Setup

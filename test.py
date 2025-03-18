@@ -1,51 +1,47 @@
-import requests
+import andes
+import networkx as nx
+import matplotlib.pyplot as plt
+import multiprocessing
 
-# Server Configuration
-SERVER_IP = "http://130.18.208.34:5000"
+def create_and_visualize_network():
+    # Initialize the ANDES system
+    system = andes.System()
 
+    # Add buses using the generic 'add' method
+    system.add("Bus", idx=1, name='Bus 1', voltage=1.0)
+    system.add("Bus", idx=2, name='Bus 2', voltage=1.0)
+    system.add("Bus", idx=3, name='Bus 3', voltage=1.0)
 
-# Replace 'your-server-ip' with the actual IP or domain.
+    # Add branches (transmission lines) connecting the buses
+    system.add("Branch", idx=1, fbus=1, tbus=2, r=0.01, x=0.1, b=0.01)
+    system.add("Branch", idx=2, fbus=2, tbus=3, r=0.01, x=0.1, b=0.01)
+    system.add("Branch", idx=3, fbus=3, tbus=1, r=0.01, x=0.1, b=0.01)
 
-# Initialize the social network
-def initialize_social_network_on_server(car_total):
-    try:
-        response = requests.post(f"{SERVER_IP}/initialize", json={"car_total": car_total})
-        if response.status_code == 200:
-            print("Social network initialized:", response.json())
-        else:
-            print("Failed to initialize social network:", response.text)
-    except requests.exceptions.RequestException as e:
-        print("Error while trying to connect to the server:", e)
+    # Prepare the system (this may trigger lazy initialization and processing)
+    system.prepare(quick=True)
 
+    # Create a NetworkX graph for visualization
+    G = nx.Graph()
 
-# Propagate the rumor
-def propagate_rumor_on_server(rumor, steps=1):
-    try:
-        response = requests.post(f"{SERVER_IP}/propagate", json={"rumor": rumor, "steps": steps})
-        if response.status_code == 200:
-            print("Rumor propagated successfully.")
-            return response.json()  # Returns the statuses
-        else:
-            print("Failed to propagate rumor:", response.text)
-    except requests.exceptions.RequestException as e:
-        print("Error while trying to connect to the server:", e)
-    return {}
+    # Retrieve bus components from the system
+    buses = system.get_components("Bus")
+    for bus in buses:
+        # Each bus is assumed to have attributes 'idx' and 'name'
+        G.add_node(bus.idx, label=bus.name)
 
+    # Retrieve branch components from the system
+    branches = system.get_components("Branch")
+    for branch in branches:
+        # Create an edge between the from bus (fbus) and the to bus (tbus)
+        G.add_edge(branch.fbus, branch.tbus)
 
-# Example Usage
-if __name__ == "__main__":
-    # Number of nodes (cars) in the social network
-    car_total = 3000
+    # Generate a layout and draw the graph
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='gray', node_size=800)
+    plt.title("Simple ANDES Power Network")
+    plt.show()
 
-    # Initialize the social network on the server
-    initialize_social_network_on_server(car_total)
-
-    # Propagate a rumor
-    rumor = "Active shooter on Main Street"
-    statuses = propagate_rumor_on_server(rumor, steps=1)
-
-    # Print the returned statuses
-    if statuses:
-        print("Node statuses:", statuses)
-    else:
-        print("No statuses received.")
+if __name__ == '__main__':
+    # Ensure proper multiprocessing support on Windows.
+    multiprocessing.freeze_support()
+    create_and_visualize_network()
