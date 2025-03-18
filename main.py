@@ -12,7 +12,6 @@ from powerNetwork import (
     run_power_flow,
     visualize_network_state,
     initialize_csv_log,
-    append_csv_column,
     simulate_local_partition_failure,
     set_node_down,
     set_node_up
@@ -68,9 +67,13 @@ def main():
             # Update power network every 10 ticks
             if tick_counter % 10 == 0:
                 current_power_step += 1
-
+                print("What kind of Outage do you want"
+                      "1. Skip\n"
+                      "2. Single\n"
+                      "3. Area")
+                choice = input("Input: ")
                 # Introduce a random node failure (10% chance)
-                if random.random() < 0.1:
+                if choice == "2":
                     candidates = [b for b in power_network.buses.index
                                   if b not in ["MainPowerGrid", "LocalSubstation"] and b not in power_down_nodes]
                     if candidates:
@@ -87,7 +90,7 @@ def main():
                     set_node_up(power_network, recov)
 
                 # Simulate a local partition failure (40% chance)
-                if random.random() < 0.4:
+                if choice == "3":
                     simulate_local_partition_failure(power_network, power_down_nodes, depth=2)
 
                 run_power_flow(power_network)
