@@ -53,24 +53,22 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
     network = pypsa.Network()
 
     # Slack bus: main power grid
-    network.add("Bus", name="MainPowerGrid", v_nom=230)
+    network.add("Bus", name="MainPowerGrid", v_nom=230, x=50, y=50)
     # LOWER the nominal capacity to ~50 MW if total load is small
-    network.add("Generator", name="MainGenerator", bus="MainPowerGrid", p_nom=50, control="Slack")
+    network.add("Generator", name="MainGenerator", bus="MainPowerGrid", p_nom=200, control="Slack")
 
     # Local substation at 20 kV
-    network.add("Bus", name="LocalSubstation", v_nom=20)
-
+    network.add("Bus", name="LocalSubstation", v_nom=20, x=60, y=50)
     # Transformer 230 -> 20 kV
     network.add(
-        "Transformer",
-        name="GridTransformer",
+        "Line",
+        "Line_MPG_LS",  # example
         bus0="MainPowerGrid",
         bus1="LocalSubstation",
-        s_nom=100,  # MVA rating
-        v_nom0=230,
-        v_nom1=20,
-        x_sc=10,  # ~10%
-        r_sc=1  # ~1%
+        length=1.0,
+        r=0.5,  # small but non-zero
+        x=0.9,
+        s_nom=100
     )
 
     # Assign short labels to traffic lights
@@ -96,6 +94,8 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
             bus0="LocalSubstation",
             bus1=feed_l,
             length=0.1,
+            r=0.1,
+            x=0.9,
             r_per_length=0.0003,  # More realistic R
             x_per_length=0.0004
         )
@@ -119,9 +119,25 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
                 bus0=from_label,
                 bus1=to_label,
                 length=dist_km,
+                x=0.5,
+                r=0.9,
                 r_per_length=r_per_m,
                 x_per_length=x_per_m
             )
+    # Right before returning:
+    if "MainPowerGrid" in network.buses.index:
+        if network.generators.empty or not (network.generators["control"] == "Slack").any():
+            network.add(
+                "Generator",
+                "SlackGen",
+                bus="MainPowerGrid",
+                p_set=0,
+                control="Slack",
+                max_p_pu=1e9,
+                min_p_pu=-1e9
+            )
+    else:
+        print("WARNING: No 'MainPowerGrid' bus found. Please create or rename a bus to serve as Slack.")
 
     return network, sumo_to_label, label_to_sumo
 
@@ -184,3 +200,30 @@ def set_node_up(network, node):
     for load_name in network.loads.index:
         if network.loads.at[load_name, "bus"] == node:
             network.loads.at[load_name, "p_set"] = 0.02
+
+
+def check_network_connectivity(network):
+    G = build_networkx_graph(network, down_nodes=[])
+    components = list(nx.connected_components(G))
+    print(f"Number of connected components: {len(components)}")
+    for i, comp in enumerate(components, 1):
+        print(f"Component {i}: {comp}")
+
+
+def check_impedance(network):
+    print("Line Impedance Values:")
+    for line in network.lines.index:
+        # If you have r and x defined directly:
+        r = network.lines.at[line, "r"] if "r" in network.lines.columns else None
+        x = network.lines.at[line, "x"] if "x" in network.lines.columns else None
+
+        length = network.lines.at[line, "length"]
+        r_eff = network.lines.r_per_length.get(line, 0) * length
+        x_eff = network.lines.x_per_length.get(line, 0) * length
+        print(f"Line {line}: effective r={r_eff:.6f}, effective x={x_eff:.6f}")
+
+        # If using per_length values, you might have columns like r_per_length and x_per_length
+        r_per_length = network.lines.at[line, "r_per_length"] if "r_per_length" in network.lines.columns else None
+        x_per_length = network.lines.at[line, "x_per_length"] if "x_per_length" in network.lines.columns else None
+
+        print(f"Line {line}: r={r} x={x} | r_per_length={r_per_length} x_per_length={x_per_length}")

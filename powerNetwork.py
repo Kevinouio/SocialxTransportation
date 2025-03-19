@@ -4,6 +4,10 @@ import time
 import copy
 import csv
 import pypsa
+import matplotlib
+
+matplotlib.use("TkAgg")  # or "Agg" or "TkAgg"
+import networkx
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
@@ -15,10 +19,13 @@ from powerNetworkGen import (
     build_networkx_graph,
     get_powered_nodes,
     set_node_down,
-    set_node_up
+    set_node_up,
+    check_network_connectivity,
+    check_impedance
 )
 
 os.environ["PROJ_LIB"] = r"C:\\Users\\kth258\\AppData\\Local\\anaconda3\\envs\\sot\\Library\\share\\proj"
+
 
 ############################
 # POWER FLOW
@@ -52,15 +59,15 @@ def run_power_flow(network):
 ############################
 
 def add_ev_charging_station(
-    network: pypsa.Network,
-    station_name: str,
-    connect_to_bus: str,
-    line_length_km: float = 1.0,
-    line_reactance_per_km: float = 0.01,
-    line_resistance_per_km: float = 0.001,
-    line_rating_mva: float = 5.0,
-    ev_load_profile_kw: pd.Series = None,
-    bus_coords: tuple = (0.0, 0.0),
+        network: pypsa.Network,
+        station_name: str,
+        connect_to_bus: str,
+        line_length_km: float = 1.0,
+        line_reactance_per_km: float = 0.01,
+        line_resistance_per_km: float = 0.001,
+        line_rating_mva: float = 5.0,
+        ev_load_profile_kw: pd.Series = None,
+        bus_coords: tuple = (0.0, 0.0),
 ):
     """
     Dynamically adds an EV charging station to the given PyPSA network by:
@@ -131,125 +138,60 @@ def add_ev_charging_station(
         ev_load_name,
         bus=ev_bus_name,
         p_set=ev_load_profile_mw,  # Time series in MW
-        q_set=0.0,                 # Set Q to 0 or your desired reactive load
+        q_set=0.0,  # Set Q to 0 or your desired reactive load
     )
 
-def add_ev_charging_station(network, station_name, connect_to_bus,
-                            line_length_km=1.0,
-                            line_x_per_km=0.01,
-                            line_r_per_km=0.001,
-                            line_rating_mva=5.0):
-    """
-    Adds a simple EV charging station to the network by:
-      - Creating a new bus
-      - Creating a line connecting to 'connect_to_bus'
-      - Adding a Load representing the EV station's demand
-    """
-    ev_bus_name = f"{station_name}_Bus"
-    ev_line_name = f"{station_name}_Line"
-    ev_load_name = f"{station_name}_Load"
 
-    # 1. Add the bus
-    network.add(
-        "Bus",
-        ev_bus_name,
-        x=0.0,  # optionally set geographic x,y if you want to visualize
-        y=0.0
-    )
-
-    # 2. Add a line to connect the EV bus to the existing bus
-    network.add(
-        "Line",
-        ev_line_name,
-        bus0=connect_to_bus,
-        bus1=ev_bus_name,
-        length=line_length_km,
-        x=line_x_per_km * line_length_km,
-        r=line_r_per_km * line_length_km,
-        s_nom=line_rating_mva
-    )
-
-    # 3. Add the EV load (initially set it to something small or zero)
-    network.add(
-        "Load",
-        ev_load_name,
-        bus=ev_bus_name,
-        p_set=0.0,   # in MW
-        q_set=0.0
-    )
-
-############################
+#
 # VISUALIZATION
 ############################
 def visualize_network_state(network, down_nodes, time_step=0):
-    """
-    Plot the network with color-coded states:
-      Red    = node is 'down'
-      Green  = node is up + BFS powered
-      Orange = node is up but disconnected
-      Yellow = substation / main grid
-    """
-    powered = get_powered_nodes(network, down_nodes)
+    """Modified visualization to handle disconnected lines and save to directory"""
+    import os
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
+    # Create output directory
+    os.makedirs("network_visuals", exist_ok=True)
 
     G = nx.Graph()
-    pos = {}
-    node_colors = []
 
-    for bus in network.buses.index:
-        if bus in ["MainPowerGrid", "LocalSubstation"]:
-            # Place them near each other for clarity
-            pos[bus] = (network.buses.x.get(bus, -50.0), network.buses.y.get(bus, -50.0))
-            node_colors.append("yellow")
-            G.add_node(bus)
+    # Add nodes
+    for bus_name in network.buses.index:
+        G.add_node(bus_name)
+
+    # Add edges only for active lines
+    for line_name in network.lines.index:
+        bus0 = network.lines.at[line_name, "bus0"]
+        bus1 = network.lines.at[line_name, "bus1"]
+
+        # Skip lines with disconnected buses
+        if pd.isna(bus0) or pd.isna(bus1):
             continue
 
-        G.add_node(bus)
-        xval = network.buses.x.get(bus, 0.0)
-        yval = network.buses.y.get(bus, 0.0)
-        pos[bus] = (xval, yval)
+        if bus0 not in down_nodes and bus1 not in down_nodes:
+            G.add_edge(bus0, bus1)
 
-        if bus in down_nodes:
-            node_colors.append("red")
-        else:
-            if bus in powered:
-                node_colors.append("green")
-            else:
-                node_colors.append("orange")
+    # Get positions from network coordinates
+    pos = {bus: (network.buses.at[bus, "x"], network.buses.at[bus, "y"])
+           for bus in G.nodes()}
 
-    # Add lines
-    for line_name in network.lines.index:
-        b0 = network.lines.at[line_name, "bus0"]
-        b1 = network.lines.at[line_name, "bus1"]
-        G.add_edge(b0, b1)
+    # Create node colors
+    node_colors = ["red" if node in down_nodes else "green" for node in G.nodes()]
 
-    # Add transformers
-    for trafo_name in network.transformers.index:
-        b0 = network.transformers.at[trafo_name, "bus0"]
-        b1 = network.transformers.at[trafo_name, "bus1"]
-        G.add_edge(b0, b1)
+    plt.figure(figsize=(12, 8))
+    nx.draw(G, pos, with_labels=True, node_size=200,
+            node_color=node_colors, edge_color="gray",
+            font_size=8, font_weight="bold")
 
-    plt.figure(figsize=(10, 8))
-    nx.draw(G, pos, with_labels=True, node_color=node_colors, edge_color="gray", font_size=8)
-    plt.title(f"Power Network at T={time_step}")
-    plt.show()
+    plt.title(f"Network State - Hour {time_step + 1}")
+    plt.savefig(f"network_visuals/network_t{time_step:02d}.png")
+    plt.close()
+
 
 ############################
 # CSV LOGGING
 ############################
-def initialize_csv_log(network, csv_file="node_stats.csv"):
-    """
-    Prepare an in-memory dict for storing v_mag/time data, plus create the CSV header.
-    Each row = node, columns = time steps T=1, T=2, ...
-    """
-    voltages = {bus: [] for bus in network.buses.index}
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        header = ["Node"]
-        writer.writerow(header)
-        # Each subsequent row: [BusName]
-        for bus in network.buses.index:
-            writer.writerow([bus])
-    return voltages
 
 
 
@@ -324,120 +266,126 @@ def simulate_local_partition_failure(network, down_nodes, center_bus=None, depth
 ############################
 # LOGGING
 ############################
-def initialize_power_flow_log():
+def initialize_power_flow_log_df(network):
     """
-    Create an empty DataFrame with columns we'll need:
-      - time (int or float)
-      - bus (string)
-      - voltage (float)
+    Create an empty DataFrame with bus names as the index.
+    Each column will represent a time step (e.g., "T=1", "T=2", ...).
     """
-    df = pd.DataFrame(columns=["time", "bus", "voltage_pu"])
+    df = pd.DataFrame(index=network.buses.index)
     return df
 
 
-def log_power_flow_snapshot(network, df, time_step):
+def append_power_flow_log_df(network, df, t):
     """
-    Run power flow, then append each bus's voltage to df.
-    Returns the updated DataFrame.
+    Runs a power flow on the network, extracts the voltage magnitudes,
+    and appends them as a new column labeled "T=t" in the DataFrame.
     """
-    # Ensure we do a power flow
     run_power_flow(network)
-
-    # If the network has at least one snapshot, we can read the last row of 'v_mag_pu'
-    if not network.buses_t.v_mag_pu.empty:
-        v_series = network.buses_t.v_mag_pu.iloc[-1]  # last row
-        # v_series is typically indexed by bus name, e.g. v_series["N1"] = 0.99, etc.
-
-        # Build a small DataFrame for this step
-        # time, bus, voltage_pu
-        step_data = []
-        for bus in network.buses.index:
-            bus_voltage = v_series.get(bus, 0.0)
-            step_data.append([time_step, bus, bus_voltage])
-
-        step_df = pd.DataFrame(step_data, columns=["time", "bus", "voltage_pu"])
-        df = pd.concat([df, step_df], ignore_index=True)
-
-    else:
-        print("No voltage data available for this snapshot.")
-
+    if network.buses_t.v_mag_pu.empty:
+        print(f"No voltage data available at time T={t}.")
+        return df
+    last_v = network.buses_t.v_mag_pu.iloc[-1]
+    df[f"T={t}"] = last_v
     return df
 
-def save_power_flow_log(df, csv_file="node_stats.csv"):
+
+def save_power_flow_log_df(df, csv_file="node_stats.csv"):
     """
-    Save the DataFrame to a CSV file.
+    Saves the DataFrame to a CSV file.
     """
-    df.to_csv(csv_file, index=False)
+    df.to_csv(csv_file, index=True)
     print(f"Saved power flow log to {csv_file}")
 
+
+# Add this helper function to preserve original connections
+def cache_original_connections(network):
+    return {
+        "lines": network.lines[["bus0", "bus1"]].copy(),
+        "buses": network.buses[["x", "y"]].copy()
+    }
 
 ############################
 # MAIN SIMULATION
 ############################
-def run_simulation():
-    network_file = "../osm.net.xml"
+import numpy as np
 
-    # Assuming you have these helper functions already:
+
+def run_simulation():
+    network_file = "osm.net.xml"
+
     traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
     road_edges = get_road_edges_from_sumo(network_file)
 
-    # Create the network
+    # Create main network with realistic parameters
     network, sumo_to_label, label_to_sumo = create_power_network(
         traffic_light_nodes,
         road_edges,
         feeders=3
     )
 
-    # --------------------------------------------------
-    # A) Add the EV charging station to the network
-    #    Suppose we connect it to an existing bus called "Bus0"
-    #    (or any bus name that exists in the created network).
-    # --------------------------------------------------
+    # Make infrastructure marginally adequate
+    network.generators.at["MainGenerator", "p_nom"] = 80  # MW
+    network.lines.at["Line_MPG_LS", "s_nom"] = 60  # MW capacity
+
+    # Set up snapshots for 24-hour simulation
+    total_steps = 24
+    network.set_snapshots(range(total_steps))
+
+    # Create realistic EV load profile (peaks at midday)
+    time_array = np.linspace(0, 2 * np.pi, total_steps)
+    ev_load_profile_mw = 10 + 70 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
+    ev_load_profile = pd.Series(ev_load_profile_mw * 1000,  # kW
+                                index=network.snapshots)
+
+    # Add EV station to existing infrastructure
+    n30_coords = (network.buses.at["N30", "x"], network.buses.at["N30", "y"])
     add_ev_charging_station(
         network=network,
         station_name="EVStation1",
-        connect_to_bus="Bus0",  # Adjust to a real bus name in your network
-        line_length_km=0.5,
-        line_x_per_km=0.01,
-        line_r_per_km=0.001,
-        line_rating_mva=5.0
+        connect_to_bus="N30",
+        ev_load_profile_kw=ev_load_profile,
+        bus_coords=(n30_coords[0] + 2, n30_coords[1] + 2),
+        line_rating_mva=35,  # Keep existing line rating
+        line_resistance_per_km=0.003,  # Realistic values for 20kV lines
+        line_reactance_per_km=0.007
     )
+    original_network_state = cache_original_connections(network)
+    # Failure tracking with recovery potential
+    # Modified failure handling in run_simulation()
+    failed_lines = set()
+    failed_buses = set()
+    voltage_threshold = 0.88  # ANSI minimum voltage standard
 
-    total_steps = 10
-    down_nodes = set()
+    for t in network.snapshots:
+        print(f"\n=== Hour {t + 1} ===")
+        print(f"EV Load: {ev_load_profile_mw[t]:.1f} MW")
 
-    # Initialize an empty DataFrame to store logs
-    df_power_log = initialize_power_flow_log()
+        # Reset previous line failures (optional: add recovery logic here)
+        # network.lines[["bus0", "bus1"]] = original_line_connections
 
-    for t in range(1, total_steps + 1):
-        print(f"\n=== Time Step {t} ===")
+        try:
+            run_power_flow(network)
+        except Exception as e:
+            print(f"⚡ Power flow failed: {str(e)[:100]}...")
+            failed_buses.add("EVStation1_Bus")
+            network.buses_t.v_mag_pu.loc[t] = 0  # Mark all buses as failed
+        else:
+            # Detect voltage violations
+            low_voltage = network.buses_t.v_mag_pu.loc[t] < voltage_threshold
+            failed_buses.update(low_voltage[low_voltage].index.tolist())
 
-        # -----------------------------------------
-        # B) Update the EV load for the current time step
-        # -----------------------------------------
-        # For demonstration, let's do something simple: ramp load linearly
-        # from 0 MW at step 1 to 0.3 MW at step 10 (i.e., 300 kW).
-        p_mw = 0.3 * (t / total_steps)
+            # Detect line overloads (100% capacity)
+            line_loading = (network.lines_t.p0.loc[t].abs() /
+                            network.lines.s_nom.replace(0, 1e-6))
+            overloaded_lines = line_loading[line_loading > 1.0].index
+            failed_lines.update(overloaded_lines)
 
-        # Update the load in the PyPSA network
-        # The load name is <station_name>_Load => "EVStation1_Load"
-        network.loads.at["EVStation1_Load", "p_set"] = p_mw
+        # Visualize current state (handles NaN buses automatically)
+        visualize_network_state(network, failed_buses, t)
 
-        # ... do your random node failures, BFS partitions, recoveries, etc. ...
-        # e.g., randomly pick some buses or lines to disable, then re-enable them.
-
-        # 2) Run PF and log the voltages
-        df_power_log = log_power_flow_snapshot(network, df_power_log, t)
-
-        # 3) (Optional) visualize the network state
-        visualize_network_state(network, down_nodes, time_step=t)
-
-        # Possibly sleep or do other timing steps, e.g. time.sleep(1)
-
-    # 4) Save the CSV once the entire simulation finishes
-    save_power_flow_log(df_power_log, "../node_stats.csv")
-
-    print("\nSimulation ended. Check node_stats.csv for logs.")
+    # Save final results
+    voltage_log = network.buses_t.v_mag_pu.copy()
+    voltage_log.T.to_csv("voltage_log.csv")
 
 
 if __name__ == "__main__":
