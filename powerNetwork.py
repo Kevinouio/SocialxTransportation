@@ -5,12 +5,12 @@ import copy
 import csv
 import pypsa
 import matplotlib
-
 matplotlib.use("TkAgg")  # or "Agg" or "TkAgg"
 import networkx
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
+import numpy as np
 
 from powerNetworkGen import (
     get_traffic_lights_from_sumo,
@@ -21,7 +21,8 @@ from powerNetworkGen import (
     set_node_down,
     set_node_up,
     check_network_connectivity,
-    check_impedance
+    check_impedance,
+    add_buildings_from_poly
 )
 
 os.environ["PROJ_LIB"] = r"C:\\Users\\kth258\\AppData\\Local\\anaconda3\\envs\\sot\\Library\\share\\proj"
@@ -142,50 +143,146 @@ def add_ev_charging_station(
     )
 
 
-#
+############################
 # VISUALIZATION
 ############################
 def visualize_network_state(network, down_nodes, time_step=0):
-    """Modified visualization to handle disconnected lines and save to directory"""
-    import os
-    import networkx as nx
-    import matplotlib.pyplot as plt
-
-    # Create output directory
-    os.makedirs("network_visuals", exist_ok=True)
-
+    """Visualize network with building nodes highlighted"""
+    plt.figure(figsize=(14, 10))
     G = nx.Graph()
 
-    # Add nodes
-    for bus_name in network.buses.index:
-        G.add_node(bus_name)
+    # Add all nodes with properties
+    for bus in network.buses.index:
+        node_size = 300 if 'BLD' in bus else 100  # Larger for buildings
+        node_color = 'blue' if 'BLD' in bus else ('red' if bus in down_nodes else 'green')
+        G.add_node(bus, size=node_size, color=node_color)
 
-    # Add edges only for active lines
-    for line_name in network.lines.index:
-        bus0 = network.lines.at[line_name, "bus0"]
-        bus1 = network.lines.at[line_name, "bus1"]
+    # Add edges (existing logic)
+    for line in network.lines.index:
+        if pd.notna(network.lines.at[line, 'bus0']) and pd.notna(network.lines.at[line, 'bus1']):
+            G.add_edge(network.lines.at[line, 'bus0'], network.lines.at[line, 'bus1'])
 
-        # Skip lines with disconnected buses
-        if pd.isna(bus0) or pd.isna(bus1):
+    # Get positions
+    pos = {bus: (network.buses.at[bus, 'x'], network.buses.at[bus, 'y']) for bus in G.nodes()}
+
+    # Draw with styles
+    nx.draw(
+        G, pos,
+        node_size=[G.nodes[bus]['size'] for bus in G.nodes()],
+        node_color=[G.nodes[bus]['color'] for bus in G.nodes()],
+        edge_color='gray',
+        with_labels=True,
+        font_size=8
+    )
+
+    plt.title(f"Network State - Hour {time_step + 1}\n"
+              f"Buildings: {len([b for b in network.buses.index if 'BLD' in b])}")
+    plt.savefig(f"network_visuals/hour_{time_step + 1:02d}.png")
+    plt.close()
+
+
+def connect_buildings_to_grid(network):
+    """
+    Connects all building buses (0.4kV) to the closest existing nodes
+    in the main power network (20kV) using transformers.
+    """
+    # Get all building buses and main network buses
+    building_buses = network.buses[network.buses.v_nom == 0.4].index
+    main_buses = network.buses[network.buses.v_nom == 20].index
+
+    # Dictionary to track existing connections to avoid duplicates
+    existing_connections = set()
+
+    for building in building_buses:
+        # Skip already connected buildings
+        if f"Trafo_{building}" in network.transformers.index:
             continue
 
-        if bus0 not in down_nodes and bus1 not in down_nodes:
-            G.add_edge(bus0, bus1)
+        min_dist = float('inf')
+        nearest_bus = None
 
-    # Get positions from network coordinates
-    pos = {bus: (network.buses.at[bus, "x"], network.buses.at[bus, "y"])
+        # Find closest main network bus
+        for main_bus in main_buses:
+            try:
+                dx = network.buses.at[main_bus, 'x'] - network.buses.at[building, 'x']
+                dy = network.buses.at[main_bus, 'y'] - network.buses.at[building, 'y']
+                dist = math.hypot(dx, dy)
+
+                if dist < min_dist and (main_bus, building) not in existing_connections:
+                    min_dist = dist
+                    nearest_bus = main_bus
+            except KeyError:
+                continue
+
+        if nearest_bus:
+            # Add transformer between main network and building
+            network.add(
+                "Transformer",
+                name=f"Trafo_{building}",
+                bus0=nearest_bus,
+                bus1=building,
+                x=0.05,  # 5% reactance
+                s_nom=0.1,  # 100 kVA
+                tap_ratio=1.0
+            )
+            existing_connections.add((nearest_bus, building))
+            print(f"Connected {building} to {nearest_bus} (distance: {min_dist:.1f}m)")
+
+
+def visualize_network_state_poly(network, down_nodes, time_step=0):
+    plt.figure(figsize=(14, 10))
+    G = nx.Graph()
+
+    # Add nodes with relative positions
+    all_x = []
+    all_y = []
+    for bus in network.buses.index:
+        if bus in down_nodes:
+            continue
+        x = network.buses.at[bus, 'x']
+        y = network.buses.at[bus, 'y']
+        all_x.append(x)
+        all_y.append(y)
+        node_size = 300 if 'BLD' in bus else 100
+        node_color = 'blue' if 'BLD' in bus else 'green'
+        G.add_node(bus, size=node_size, color=node_color)
+
+    # Calculate plot center
+    plot_center_x = (max(all_x) + min(all_x)) / 2
+    plot_center_y = (max(all_y) + min(all_y)) / 2
+
+    # Create relative positions (meters from center)
+    pos = {
+        bus: (
+            network.buses.at[bus, 'x'] - plot_center_x,
+            network.buses.at[bus, 'y'] - plot_center_y
+        )
+        for bus in G.nodes
+    }
+
+    # Draw nodes and edges
+    nx.draw(G, pos, node_size=[G.nodes[bus]['size'] for bus in G.nodes],
+            node_color=[G.nodes[bus]['color'] for bus in G.nodes],
+            edge_color='gray', with_labels=True, font_size=8)
+
+    # Use raw UTM coordinates
+    pos = {bus: (network.buses.at[bus, 'x'], network.buses.at[bus, 'y'])
            for bus in G.nodes()}
 
-    # Create node colors
-    node_colors = ["red" if node in down_nodes else "green" for node in G.nodes()]
+    # Set axis labels in kilometers
+    all_x = network.buses.x[G.nodes()]
+    all_y = network.buses.y[G.nodes()]
 
-    plt.figure(figsize=(12, 8))
-    nx.draw(G, pos, with_labels=True, node_size=200,
-            node_color=node_colors, edge_color="gray",
-            font_size=8, font_weight="bold")
+    plt.xlim(min(all_x) - 100, max(all_x) + 100)  # 100m buffer
+    plt.ylim(min(all_y) - 100, max(all_y) + 100)
+
+    plt.gca().set_aspect('equal')
+    plt.xlabel("UTM Easting (m)")
+    plt.ylabel("UTM Northing (m)")
+
 
     plt.title(f"Network State - Hour {time_step + 1}")
-    plt.savefig(f"network_visuals/network_t{time_step:02d}.png")
+    plt.savefig(f"network_visuals/hour_{time_step + 1:02d}.png")
     plt.close()
 
 
@@ -304,17 +401,177 @@ def cache_original_connections(network):
         "buses": network.buses[["x", "y"]].copy()
     }
 
+
+def create_power_network_from_poly(poly_file="osm.poly.xml"):
+    """
+    Creates a PyPSA network from SUMO building polygons with:
+    - Main grid (20 kV) -> Substation (20 kV) -> Buildings (0.4 kV via transformers)
+    - Each building has a small load
+    - Radial connection through transformers
+    """
+    import xml.etree.ElementTree as ET
+    from shapely.geometry import Polygon
+    import pyproj
+    import numpy as np
+
+    network = pypsa.Network()
+
+    # ======================
+    # 1. Core Infrastructure
+    # ======================
+    # Main power grid (slack bus)
+    network.add("Bus", "MainPowerGrid", v_nom=20, x=50, y=50)
+    network.add("Generator", "MainGenerator", bus="MainPowerGrid",
+                p_nom=100, control="Slack")
+
+    # Local substation
+    network.add("Bus", "LocalSubstation", v_nom=20, x=60, y=50)
+    network.add("Line", "Line_Grid_Sub", bus0="MainPowerGrid",
+                bus1="LocalSubstation", x=0.1, r=0.01, s_nom=100)
+
+    # ======================
+    # 2. Coordinate System Setup
+    # ======================
+    tree = ET.parse(poly_file)
+    root = tree.getroot()
+    location = root.find('location')
+
+    # Validate projection parameters
+    if location is None:
+        raise ValueError("Missing <location> element in poly file")
+
+    proj_params = location.get('projParameter', '')
+    if '+proj=utm' not in proj_params or '+zone=' not in proj_params:
+        raise ValueError("Only UTM projections are supported")
+
+    # Extract UTM zone and hemisphere
+    zone = proj_params.split('+zone=')[1].split()[0]
+    hemisphere = 'north' if '+north' in proj_params else 'south'
+    epsg_code = 32600 + int(zone) if hemisphere == 'north' else 32700 + int(zone)
+
+    # Create coordinate transformer
+    transformer = pyproj.Transformer.from_crs(
+        f"EPSG:{epsg_code}",
+        'EPSG:3857'  # Web Mercator
+    )
+
+    # ======================
+    # 3. Process Buildings
+    # ======================
+    building_count = 0
+    skipped_buildings = 0
+
+    for poly_elem in root.findall('poly'):
+        if not poly_elem.get('type', '').startswith('building'):
+            continue
+
+        # Parse UTM coordinates directly
+        shape_str = poly_elem.get('shape')
+        coords = [tuple(map(float, p.split(','))) for p in shape_str.split()]
+
+        try:
+            # Create polygon from raw UTM coordinates
+            utm_poly = Polygon(coords)
+            if not utm_poly.is_valid:
+                continue
+            centroid = utm_poly.centroid
+        except:
+            continue
+
+        # Add bus with UTM coordinates
+        building_id = f"BLD{poly_elem.get('id')}"
+        network.add("Bus", building_id, v_nom=0.4,
+                    x=centroid.x, y=centroid.y)  # Direct UTM values
+        # Add residential load (2-5 kW)
+        network.add("Load", f"Load_{building_id}", bus=building_id,
+                    p_set=np.random.uniform(0.002, 0.005))  # MW
+
+        # Connect to substation via transformer (20 kV -> 0.4 kV)
+        network.add("Transformer", f"Trafo_{building_id}",
+                    bus0="LocalSubstation", bus1=building_id,
+                    x=0.05, s_nom=0.1)
+
+        building_count += 1
+
+    # ======================
+    # 5. Final Validation
+    # ======================
+    if building_count == 0:
+        raise RuntimeError(f"No valid buildings found in {poly_file}")
+
+    print(f"Network created with:"
+          f"\n- {building_count} buildings"
+          f"\n- {skipped_buildings} invalid buildings skipped"
+          f"\n- Base load: {len(network.loads)} loads")
+
+    return network
+
 ############################
 # MAIN SIMULATION
 ############################
-import numpy as np
+############################
+# POLY-FILE SIMULATION
+############################
+
+def run_poly_simulation():
+    """Run full simulation using buildings from poly file as primary nodes"""
+    # 1. Create network from poly file
+    network = create_power_network_from_poly("osm.poly.xml")
+
+    # 2. Setup temporal parameters
+    total_steps = 24
+    network.set_snapshots(range(total_steps))
+
+    # 3. Add EV charging station to substation
+    substation_coords = (
+        network.buses.at["LocalSubstation", "x"],
+        network.buses.at["LocalSubstation", "y"]
+    )
+    add_ev_charging_station(
+        network=network,
+        station_name="Poly_EV_Station",
+        connect_to_bus="LocalSubstation",
+        bus_coords=(substation_coords[0] + 2, substation_coords[1] + 2),
+        line_rating_mva=50,
+        line_resistance_per_km=0.002,
+        line_reactance_per_km=0.005
+    )
+
+    # 4. Initialize failure tracking
+    failed_buses = set()
+    voltage_threshold = 0.88
+
+    # 5. Main simulation loop
+    for t in network.snapshots:
+        print(f"\n=== Poly Network - Hour {t + 1} ===")
+
+        try:
+            run_power_flow(network)
+        except Exception as e:
+            print(f"Power flow failed: {str(e)[:100]}")
+            failed_buses.update(network.buses.index)
+        else:
+            # Voltage violation checks
+            low_voltage = network.buses_t.v_mag_pu.loc[t] < voltage_threshold
+            failed_buses.update(low_voltage[low_voltage].index.tolist())
+
+        # Visualization
+        visualize_network_state_poly(network, failed_buses, t)
+
+    # 6. Save results
+    network.buses_t.v_mag_pu.T.to_csv("poly_voltage_log.csv")
+    print("\nPoly-based simulation complete")
 
 
 def run_simulation():
+    # Create base network
     network_file = "osm.net.xml"
-
     traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
     road_edges = get_road_edges_from_sumo(network_file)
+    network, sumo_to_label, label_to_sumo = create_power_network(traffic_light_nodes, road_edges, feeders=3)
+
+    # Add buildings to the same network instance
+    add_buildings_from_poly(network)
 
     # Create main network with realistic parameters
     network, sumo_to_label, label_to_sumo = create_power_network(
@@ -329,6 +586,10 @@ def run_simulation():
 
     # Set up snapshots for 24-hour simulation
     total_steps = 24
+    print("\nNetwork Summary:")
+    print(f"Total buses: {len(network.buses)}")
+    print(f"Building buses: {len([b for b in network.buses.index if 'BLD' in b])}")
+
     network.set_snapshots(range(total_steps))
 
     # Create realistic EV load profile (peaks at midday)
@@ -389,4 +650,4 @@ def run_simulation():
 
 
 if __name__ == "__main__":
-    run_simulation()
+    run_poly_simulation()

@@ -3,7 +3,7 @@ import os
 import math
 import pypsa
 import networkx as nx
-
+import numpy as np
 os.environ["PROJ_LIB"] = r"C:\Users\kth258\AppData\Local\anaconda3\envs\sot\Library\share\proj"
 
 
@@ -227,3 +227,108 @@ def check_impedance(network):
         x_per_length = network.lines.at[line, "x_per_length"] if "x_per_length" in network.lines.columns else None
 
         print(f"Line {line}: r={r} x={x} | r_per_length={r_per_length} x_per_length={x_per_length}")
+
+
+
+def add_buildings_from_poly(network, poly_file="osm.poly.xml"):
+    """Add buildings from SUMO poly file with proper UTM handling"""
+    import xml.etree.ElementTree as ET
+    from shapely.geometry import Polygon
+    import pyproj
+    import math
+
+    tree = ET.parse(poly_file)
+    root = tree.getroot()
+
+    # Extract and validate UTM parameters
+    location = root.find('location')
+    proj_params = location.get('projParameter')
+
+    if '+proj=utm' in proj_params and '+zone=' in proj_params:
+        # Extract UTM zone and hemisphere
+        zone = proj_params.split('+zone=')[1].split()[0]
+        if not zone.isdigit() or int(zone) < 1 or int(zone) > 60:
+            raise ValueError(f"Invalid UTM zone: {zone}")
+
+        hemisphere = 'north' if '+north' in proj_params else 'south'
+        epsg_code = 32600 + int(zone) if hemisphere == 'north' else 32700 + int(zone)
+
+        transformer = pyproj.Transformer.from_crs(
+            f"EPSG:{epsg_code}",
+            'EPSG:3857'  # Web Mercator for network coordinates
+        )
+    else:
+        raise ValueError("Unsupported projection parameters")
+
+    # Process buildings
+    for poly_elem in root.findall('poly'):
+        if not poly_elem.get('type', '').startswith('building'):
+            continue
+
+        shape_str = poly_elem.get('shape')
+        if not shape_str:
+            continue
+
+        coords = [tuple(map(float, p.split(','))) for p in shape_str.split()]
+
+        # Validate coordinates (minimum 4 points for closed polygon)
+        if len(coords) < 4:
+            print(f"Skipping building {poly_elem.get('id')} - insufficient coordinates")
+            continue
+
+        # Close the polygon if needed
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+
+        # Transform coordinates
+        transformed_coords = [transformer.transform(x, y) for x, y in coords]
+
+        # Create polygon and validate
+        try:
+            building_poly = Polygon(transformed_coords)  # Renamed variable
+            if not building_poly.is_valid:
+                raise ValueError("Invalid polygon geometry")
+        except Exception as e:
+            print(f"Skipping invalid building {poly_elem.get('id')}: {str(e)}")
+            continue
+
+        # Get centroid
+        centroid = building_poly.centroid
+
+        print("BUILDING WA MADE")
+
+        # Generate unique ID from XML element
+        building_id = f"BLD{poly_elem.get('id')}"  # Use poly_elem instead of poly
+
+        # Add to network (rest of the code remains the same)
+        network.add("Bus",
+                    name=building_id,
+                    v_nom=0.4,
+                    x=centroid.x,
+                    y=centroid.y)
+
+        network.add("Load",
+                    name=f"load_{building_id}",
+                    bus=building_id,
+                    p_set=np.random.uniform(0.005, 0.02))
+
+        # Connect to grid
+        min_dist = float('inf')
+        nearest_bus = None
+        for bus in network.buses.index:
+            if network.buses.at[bus, 'v_nom'] == 20:
+                dx = network.buses.at[bus, 'x'] - centroid.x
+                dy = network.buses.at[bus, 'y'] - centroid.y
+                dist = math.hypot(dx, dy)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_bus = bus
+
+        if nearest_bus:
+            network.add("Line",
+                        name=f"line_{building_id}",
+                        bus0=nearest_bus,
+                        bus1=building_id,
+                        length=min_dist / 1000,
+                        r=0.0003 * min_dist,
+                        x=0.0004 * min_dist)
