@@ -231,36 +231,16 @@ def check_impedance(network):
 
 
 def add_buildings_from_poly(network, poly_file="osm.poly.xml"):
-    """Add buildings from SUMO poly file with proper UTM handling"""
+    """Add buildings from SUMO poly file using raw UTM coordinates"""
     import xml.etree.ElementTree as ET
     from shapely.geometry import Polygon
-    import pyproj
     import math
 
     tree = ET.parse(poly_file)
     root = tree.getroot()
 
-    # Extract and validate UTM parameters
-    location = root.find('location')
-    proj_params = location.get('projParameter')
-
-    if '+proj=utm' in proj_params and '+zone=' in proj_params:
-        # Extract UTM zone and hemisphere
-        zone = proj_params.split('+zone=')[1].split()[0]
-        if not zone.isdigit() or int(zone) < 1 or int(zone) > 60:
-            raise ValueError(f"Invalid UTM zone: {zone}")
-
-        hemisphere = 'north' if '+north' in proj_params else 'south'
-        epsg_code = 32600 + int(zone) if hemisphere == 'north' else 32700 + int(zone)
-
-        transformer = pyproj.Transformer.from_crs(
-            f"EPSG:{epsg_code}",
-            'EPSG:3857'  # Web Mercator for network coordinates
-        )
-    else:
-        raise ValueError("Unsupported projection parameters")
-
     # Process buildings
+    building_coords = []
     for poly_elem in root.findall('poly'):
         if not poly_elem.get('type', '').startswith('building'):
             continue
@@ -271,52 +251,34 @@ def add_buildings_from_poly(network, poly_file="osm.poly.xml"):
 
         coords = [tuple(map(float, p.split(','))) for p in shape_str.split()]
 
-        # Validate coordinates (minimum 4 points for closed polygon)
+        # Validate coordinates
         if len(coords) < 4:
-            print(f"Skipping building {poly_elem.get('id')} - insufficient coordinates")
             continue
 
-        # Close the polygon if needed
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-
-        # Transform coordinates
-        transformed_coords = [transformer.transform(x, y) for x, y in coords]
-
-        # Create polygon and validate
+        # Create polygon directly from UTM coordinates
         try:
-            building_poly = Polygon(transformed_coords)  # Renamed variable
-            if not building_poly.is_valid:
-                raise ValueError("Invalid polygon geometry")
+            utm_poly = Polygon(coords)
+            if not utm_poly.is_valid:
+                continue
+            centroid = utm_poly.centroid
         except Exception as e:
             print(f"Skipping invalid building {poly_elem.get('id')}: {str(e)}")
             continue
 
-        # Get centroid
-        centroid = building_poly.centroid
+        # Add to network with raw UTM coordinates
+        building_id = f"BLD{poly_elem.get('id')}"
+        network.add("Bus", building_id, v_nom=0.4,
+                   x=centroid.x,  # Direct UTM X
+                   y=centroid.y)  # Direct UTM Y
 
-        print("BUILDING WA MADE")
+        network.add("Load", f"load_{building_id}", bus=building_id,
+                   p_set=np.random.uniform(0.005, 0.02))
 
-        # Generate unique ID from XML element
-        building_id = f"BLD{poly_elem.get('id')}"  # Use poly_elem instead of poly
-
-        # Add to network (rest of the code remains the same)
-        network.add("Bus",
-                    name=building_id,
-                    v_nom=0.4,
-                    x=centroid.x,
-                    y=centroid.y)
-
-        network.add("Load",
-                    name=f"load_{building_id}",
-                    bus=building_id,
-                    p_set=np.random.uniform(0.005, 0.02))
-
-        # Connect to grid
+        # Connect to grid with TRANSFORMER (20kV -> 0.4kV)
         min_dist = float('inf')
         nearest_bus = None
         for bus in network.buses.index:
-            if network.buses.at[bus, 'v_nom'] == 20:
+            if network.buses.at[bus, 'v_nom'] == 20:  # Traffic nodes are 20kV
                 dx = network.buses.at[bus, 'x'] - centroid.x
                 dy = network.buses.at[bus, 'y'] - centroid.y
                 dist = math.hypot(dx, dy)
@@ -325,10 +287,11 @@ def add_buildings_from_poly(network, poly_file="osm.poly.xml"):
                     nearest_bus = bus
 
         if nearest_bus:
-            network.add("Line",
-                        name=f"line_{building_id}",
-                        bus0=nearest_bus,
-                        bus1=building_id,
-                        length=min_dist / 1000,
-                        r=0.0003 * min_dist,
-                        x=0.0004 * min_dist)
+            network.add(
+                "Transformer",
+                f"trafo_{building_id}",
+                bus0=nearest_bus,
+                bus1=building_id,
+                x=0.05,  # 5% reactance
+                s_nom=0.1  # 100 kVA
+            )

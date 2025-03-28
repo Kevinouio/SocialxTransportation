@@ -5,12 +5,14 @@ import copy
 import csv
 import pypsa
 import matplotlib
+
 matplotlib.use("TkAgg")  # or "Agg" or "TkAgg"
 import networkx
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
 import numpy as np
+import math
 
 from powerNetworkGen import (
     get_traffic_lights_from_sumo,
@@ -146,40 +148,6 @@ def add_ev_charging_station(
 ############################
 # VISUALIZATION
 ############################
-def visualize_network_state(network, down_nodes, time_step=0):
-    """Visualize network with building nodes highlighted"""
-    plt.figure(figsize=(14, 10))
-    G = nx.Graph()
-
-    # Add all nodes with properties
-    for bus in network.buses.index:
-        node_size = 300 if 'BLD' in bus else 100  # Larger for buildings
-        node_color = 'blue' if 'BLD' in bus else ('red' if bus in down_nodes else 'green')
-        G.add_node(bus, size=node_size, color=node_color)
-
-    # Add edges (existing logic)
-    for line in network.lines.index:
-        if pd.notna(network.lines.at[line, 'bus0']) and pd.notna(network.lines.at[line, 'bus1']):
-            G.add_edge(network.lines.at[line, 'bus0'], network.lines.at[line, 'bus1'])
-
-    # Get positions
-    pos = {bus: (network.buses.at[bus, 'x'], network.buses.at[bus, 'y']) for bus in G.nodes()}
-
-    # Draw with styles
-    nx.draw(
-        G, pos,
-        node_size=[G.nodes[bus]['size'] for bus in G.nodes()],
-        node_color=[G.nodes[bus]['color'] for bus in G.nodes()],
-        edge_color='gray',
-        with_labels=True,
-        font_size=8
-    )
-
-    plt.title(f"Network State - Hour {time_step + 1}\n"
-              f"Buildings: {len([b for b in network.buses.index if 'BLD' in b])}")
-    plt.savefig(f"network_visuals/hour_{time_step + 1:02d}.png")
-    plt.close()
-
 
 def connect_buildings_to_grid(network):
     """
@@ -270,8 +238,10 @@ def visualize_network_state_poly(network, down_nodes, time_step=0):
            for bus in G.nodes()}
 
     # Set axis labels in kilometers
-    all_x = network.buses.x[G.nodes()]
-    all_y = network.buses.y[G.nodes()]
+    # Fixed version
+    node_list = list(G.nodes())
+    all_x = network.buses.x[node_list]
+    all_y = network.buses.y[node_list]
 
     plt.xlim(min(all_x) - 100, max(all_x) + 100)  # 100m buffer
     plt.ylim(min(all_y) - 100, max(all_y) + 100)
@@ -280,17 +250,61 @@ def visualize_network_state_poly(network, down_nodes, time_step=0):
     plt.xlabel("UTM Easting (m)")
     plt.ylabel("UTM Northing (m)")
 
-
     plt.title(f"Network State - Hour {time_step + 1}")
     plt.savefig(f"network_visuals/hour_{time_step + 1:02d}.png")
     plt.close()
 
 
-############################
-# CSV LOGGING
-############################
+# Updated visualize_network_state (add transformers)
+def visualize_network_state(network, down_nodes, time_step=0):
+    os.makedirs("network_visuals", exist_ok=True)
+    plt.figure(figsize=(14, 10))
+    G = nx.Graph()
 
+    # Add nodes
+    for bus in network.buses.index:
+        node_size = 300 if 'BLD' in bus else 100
+        node_color = 'blue' if 'BLD' in bus else ('red' if bus in down_nodes else 'green')
+        G.add_node(bus, size=node_size, color=node_color)
 
+    # Add both lines AND transformers
+    # Lines
+    for line in network.lines.index:
+        b0, b1 = network.lines.at[line, 'bus0'], network.lines.at[line, 'bus1']
+        if pd.notna(b0) and pd.notna(b1):
+            G.add_edge(b0, b1)
+
+    # Transformers (critical addition)
+    for trafo in network.transformers.index:
+        b0, b1 = network.transformers.at[trafo, 'bus0'], network.transformers.at[trafo, 'bus1']
+        if pd.notna(b0) and pd.notna(b1):
+            G.add_edge(b0, b1)
+
+    # Get positions
+    pos = {bus: (network.buses.at[bus, 'x'], network.buses.at[bus, 'y'])
+           for bus in G.nodes()}
+
+    # Draw with styles
+    nx.draw(
+        G, pos,
+        node_size=[G.nodes[bus]['size'] for bus in G.nodes()],
+        node_color=[G.nodes[bus]['color'] for bus in G.nodes()],
+        edge_color='gray',
+        with_labels=True,
+        font_size=8
+    )
+
+    # Set axis limits
+    all_x = [network.buses.at[bus, 'x'] for bus in G.nodes()]
+    all_y = [network.buses.at[bus, 'y'] for bus in G.nodes()]
+    plt.xlim(min(all_x) - 100, max(all_x) + 100)
+    plt.ylim(min(all_y) - 100, max(all_y) + 100)
+
+    plt.title(f"Combined Network State - Hour {time_step + 1}\n"
+              f"Traffic Nodes: {len([b for b in network.buses.index if 'N' in b])} | "
+              f"Buildings: {len([b for b in network.buses.index if 'BLD' in b])}")
+    plt.savefig(f"network_visuals/combined_hour_{time_step + 1:02d}.png")
+    plt.close()
 
 ############################
 # LARGE-SCALE / PARTITION FAILURES
@@ -360,6 +374,42 @@ def simulate_local_partition_failure(network, down_nodes, center_bus=None, depth
         set_node_down(network, fn)
 
 
+############################
+# DEBUG UTILITIES
+############################
+def debug_node_coordinates(network):
+    """Prints coordinates and details of all network nodes"""
+    print("\n=== NODE COORDINATE DEBUG ===")
+    print(f"{'Node Name':<15} | {'X (m)':<12} | {'Y (m)':<12} | {'Voltage (kV)':<12} | {'Type':<10}")
+    print("-" * 70)
+
+    building_count = 0
+    traffic_node_count = 0
+    other_count = 0
+
+    for bus in network.buses.index:
+        x = network.buses.at[bus, 'x']
+        y = network.buses.at[bus, 'y']
+        v_nom = network.buses.at[bus, 'v_nom']
+
+        if 'BLD' in bus:
+            node_type = 'Building'
+            building_count += 1
+        elif bus.startswith('N') and bus[1:].isdigit():
+            node_type = 'Traffic Node'
+            traffic_node_count += 1
+        else:
+            node_type = 'Infrastructure'
+            other_count += 1
+
+        print(f"{bus:<15} | {x:<12.2f} | {y:<12.2f} | {v_nom:<12.1f} | {node_type:<10}")
+
+    print("\n=== SUMMARY ===")
+    print(f"Total Nodes: {len(network.buses.index)}")
+    print(f"- Traffic Nodes: {traffic_node_count}")
+    print(f"- Buildings: {building_count}")
+    print(f"- Other Infrastructure: {other_count}")
+    print("=" * 70 + "\n")
 ############################
 # LOGGING
 ############################
@@ -506,44 +556,63 @@ def create_power_network_from_poly(poly_file="osm.poly.xml"):
 
     return network
 
+
 ############################
 # MAIN SIMULATION
 ############################
-############################
-# POLY-FILE SIMULATION
-############################
+def run_combined_simulation():
+    """Simulation combining traffic light network and poly-file buildings"""
+    # 1. Create base traffic light network
+    network_file = "osm.net.xml"
+    traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
+    road_edges = get_road_edges_from_sumo(network_file)
+    network, sumo_to_label, label_to_sumo = create_power_network(
+        traffic_light_nodes,
+        road_edges,
+        feeders=3
+    )
 
-def run_poly_simulation():
-    """Run full simulation using buildings from poly file as primary nodes"""
-    # 1. Create network from poly file
-    network = create_power_network_from_poly("osm.poly.xml")
+    # 2. Add buildings from poly file
+    add_buildings_from_poly(network, "osm.poly.xml")
 
-    # 2. Setup temporal parameters
+    # 3. Connect buildings to closest traffic nodes
+    connect_buildings_to_grid(network)
+    debug_node_coordinates(network)
+
+    # 4. Infrastructure tuning
+    network.generators.at["MainGenerator", "p_nom"] = 150  # MW
+    network.lines.at["Line_MPG_LS", "s_nom"] = 100  # MW capacity
+
+    # 5. Set up temporal parameters
     total_steps = 24
     network.set_snapshots(range(total_steps))
 
-    # 3. Add EV charging station to substation
-    substation_coords = (
-        network.buses.at["LocalSubstation", "x"],
-        network.buses.at["LocalSubstation", "y"]
-    )
+    # Create realistic EV load profile (peaks at midday)
+    time_array = np.linspace(0, 2 * np.pi, total_steps)
+    ev_load_profile_mw = 10 + 70 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
+    ev_load_profile = pd.Series(ev_load_profile_mw * 1000,  # kW
+                                index=network.snapshots)
+
+    # Add EV station to existing infrastructure
+    n30_coords = (network.buses.at["N30", "x"], network.buses.at["N30", "y"])
     add_ev_charging_station(
         network=network,
-        station_name="Poly_EV_Station",
-        connect_to_bus="LocalSubstation",
-        bus_coords=(substation_coords[0] + 2, substation_coords[1] + 2),
-        line_rating_mva=50,
-        line_resistance_per_km=0.002,
-        line_reactance_per_km=0.005
+        station_name="EVStation1",
+        connect_to_bus="N30",
+        ev_load_profile_kw=ev_load_profile,
+        bus_coords=(n30_coords[0] + 2, n30_coords[1] + 2),
+        line_rating_mva=35,  # Keep existing line rating
+        line_resistance_per_km=0.003,  # Realistic values for 20kV lines
+        line_reactance_per_km=0.007
     )
 
-    # 4. Initialize failure tracking
+    # 7. Initialize failure tracking
     failed_buses = set()
-    voltage_threshold = 0.88
+    voltage_threshold = 0.88  # ANSI standard
 
-    # 5. Main simulation loop
+    # 8. Main simulation loop
     for t in network.snapshots:
-        print(f"\n=== Poly Network - Hour {t + 1} ===")
+        print(f"\n=== Combined Network - Hour {t + 1} ===")
 
         try:
             run_power_flow(network)
@@ -551,16 +620,17 @@ def run_poly_simulation():
             print(f"Power flow failed: {str(e)[:100]}")
             failed_buses.update(network.buses.index)
         else:
-            # Voltage violation checks
+            # Voltage violations
             low_voltage = network.buses_t.v_mag_pu.loc[t] < voltage_threshold
             failed_buses.update(low_voltage[low_voltage].index.tolist())
 
         # Visualization
-        visualize_network_state_poly(network, failed_buses, t)
+        visualize_network_state(network, failed_buses, t)
 
-    # 6. Save results
-    network.buses_t.v_mag_pu.T.to_csv("poly_voltage_log.csv")
-    print("\nPoly-based simulation complete")
+    # 9. Save results
+    network.buses_t.v_mag_pu.T.to_csv("combined_voltage_log.csv")
+    print("\nCombined simulation complete")
+
 
 
 def run_simulation():
@@ -650,4 +720,4 @@ def run_simulation():
 
 
 if __name__ == "__main__":
-    run_poly_simulation()
+    run_combined_simulation()
