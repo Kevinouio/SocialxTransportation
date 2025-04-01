@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("TkAgg")  # or "Agg" or "TkAgg"
 import networkx
 import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 import networkx as nx
 import pandas as pd
 import numpy as np
