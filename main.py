@@ -3,6 +3,11 @@ import random
 import time
 import numpy as np
 import pandas as pd
+import logging
+
+# Suppress PyPSA logging
+logging.getLogger('pypsa').setLevel(logging.ERROR)
+logging.getLogger('pypsa.pf').setLevel(logging.CRITICAL)
 
 # Traffic simulation utilities
 from network_utils import get_edge_to_street_mapping, get_street_to_edges_mapping, count_vehicles_in_route_file
@@ -17,10 +22,8 @@ from powerNetwork import (
     initialize_power_flow_log_df,
     append_power_flow_log_df,
     save_power_flow_log_df,
-    simulate_local_partition_failure,
     set_node_down,
-    set_node_up,
-    add_ev_charging_station
+    set_node_up
 )
 
 
@@ -39,42 +42,28 @@ def main():
     street_crossings = {edge: 0 for edge in edge_to_street.keys()}
 
     traci.start(["sumo-gui", "-n", traffic_network_file, "-r", route_file])
+    tl_ids = traci.trafficlight.getIDList()
 
     # -------------------------------
     # Power Network Simulation Setup
     # -------------------------------
-    # Create base power network
     traffic_light_nodes = get_traffic_lights_from_sumo(traffic_network_file)
     road_edges = get_road_edges_from_sumo(traffic_network_file)
     power_network, sumo_to_label, label_to_sumo = create_power_network(traffic_light_nodes, road_edges, feeders=3)
-
-    # Add buildings from poly file
     add_buildings_from_poly(power_network, "osm.poly.xml")
 
-    # Add EV charging station with realistic load profile
-    time_array = np.linspace(0, 2 * np.pi, 24)
-    ev_load_profile_mw = 10 + 70 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW daily variation
-    ev_load_profile = pd.Series(ev_load_profile_mw * 1000, index=power_network.snapshots)
-
-    n30_coords = (power_network.buses.at["N30", 'x'], power_network.buses.at["N30", 'y'])
-    add_ev_charging_station(
-        network=power_network,
-        station_name="EVStation1",
-        connect_to_bus="N30",
-        ev_load_profile_kw=ev_load_profile,
-        bus_coords=(n30_coords[0] + 2, n30_coords[1] + 2),
-        line_rating_mva=35
-    )
-
-    # Initialize power flow logging
+    # Initialize tracking
     power_log_df = initialize_power_flow_log_df(power_network)
     current_power_step = 0
-    power_down_nodes = set()
+    power_down_nodes = {}
+    tl_to_power_node = {tl_id: sumo_to_label[tl_id] for tl_id in tl_ids if tl_id in sumo_to_label}
 
     # -------------------------------
     # Main Simulation Loop
     # -------------------------------
-    tick_counter = -1
+    tick_counter = 0
+    power_update_interval = 10  # Update power network every 10 traffic steps
+    failure_duration = 1000  # 1000 steps = ~10 minutes in simulation time
 
     try:
         while traci.simulation.getMinExpectedNumber() > 0:
@@ -85,52 +74,59 @@ def main():
             for edge in street_crossings.keys():
                 street_crossings[edge] += traci.edge.getLastStepVehicleNumber(edge)
 
-            # Update power network every 10 traffic steps
-            if tick_counter % 10 == 0:
+            # Power network updates
+            if tick_counter % power_update_interval == 0:
                 current_power_step += 1
 
-                # Automated outage selection
-                choice = random.choices(["1", "2", "3"], weights=[5, 3, 2], k=1)[0]
+                # SINGLE NODE FAILURE MECHANISM
+                candidates = [b for b in power_network.buses.index
+                              if b not in ["MainPowerGrid", "LocalSubstation"]
+                              and b not in power_down_nodes]
 
-                if choice == "2":
-                    candidates = [b for b in power_network.buses.index
-                                  if b not in ["MainPowerGrid", "LocalSubstation"] and b not in power_down_nodes]
-                    if candidates:
-                        fail_node = random.choice(candidates)
-                        power_down_nodes.add(fail_node)
-                        set_node_down(power_network, fail_node)
+                if candidates:
+                    fail_node = random.choice(candidates)
+                    power_down_nodes[fail_node] = tick_counter + failure_duration
+                    set_node_down(power_network, fail_node)
+                    print(
+                        f"\n🔴 Node {fail_node} failed at step {tick_counter} (recovers at {tick_counter + failure_duration})")
 
-                if choice == "3":
-                    simulate_local_partition_failure(power_network, power_down_nodes, depth=2)
+                # Handle recoveries
+                nodes_to_recover = [node for node, recovery in power_down_nodes.items() if tick_counter >= recovery]
+                for node in nodes_to_recover:
+                    set_node_up(power_network, node)
+                    del power_down_nodes[node]
+                    print(f"\n🟢 Node {node} recovered at step {tick_counter}")
 
-                # Random recovery
-                if random.random() < 0.1 and power_down_nodes:
-                    recov = random.choice(list(power_down_nodes))
-                    power_down_nodes.remove(recov)
-                    set_node_up(power_network, recov)
+                # Update traffic lights
+                for tl_id, power_node in tl_to_power_node.items():
+                    current_state = traci.trafficlight.getRedYellowGreenState(tl_id)
+                    if power_node in power_down_nodes:
+                        if 'r' not in current_state.lower():
+                            traci.trafficlight.setRedYellowGreenState(tl_id, "rrrr")
+                    else:
+                        if current_state != "GGgg":
+                            traci.trafficlight.setRedYellowGreenState(tl_id, "GGgg")
 
-                # Run power flow and log results
-                run_power_flow(power_network)
-                power_log_df = append_power_flow_log_df(power_network, power_log_df, current_power_step)
-                visualize_network_state(power_network, power_down_nodes, time_step=current_power_step)
-                time.sleep(0.1)
+                # Run silent power flow
+                try:
+                    run_power_flow(power_network)
+                    power_log_df = append_power_flow_log_df(power_network, power_log_df, current_power_step)
+                    visualize_network_state(power_network, power_down_nodes.keys(), time_step=current_power_step)
+                except Exception as e:
+                    pass  # Silently handle power flow errors
 
+            time.sleep(0.05)  # Slower simulation for observation
+
+    except Exception as e:
+        print(f"Simulation ended: {str(e)}")
     finally:
-        # -------------------------------
-        # Simulation Cleanup
-        # -------------------------------
-        # Save power logs
-        save_power_flow_log_df(power_log_df, "combined_power_log.csv")
-
-        # Save traffic statistics
-        grouped_stats = {}
-        for edge, count in street_crossings.items():
-            street_name = edge_to_street.get(edge, "Unknown")
-            grouped_stats[f"{street_name} ({edge})"] = count
-        update_street_statistics_csv(grouped_stats, "No Rumor Injected")
-
+        save_power_flow_log_df(power_log_df, "power_log.csv")
+        update_street_statistics_csv(
+            {f"{edge_to_street.get(e, 'Unknown')} ({e})": c for e, c in street_crossings.items()},
+            "traffic_stats.csv"
+        )
         traci.close()
-        print("Co-simulation completed successfully")
+        print(f"Simulation completed after {tick_counter} steps")
 
 
 if __name__ == "__main__":

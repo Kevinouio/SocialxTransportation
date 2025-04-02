@@ -139,7 +139,10 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
     else:
         print("WARNING: No 'MainPowerGrid' bus found. Please create or rename a bus to serve as Slack.")
 
-    return network, sumo_to_label, label_to_sumo
+    # Add at the end before return
+    original_graph = build_networkx_graph(network, down_nodes=set())
+
+    return network, sumo_to_label, label_to_sumo, original_graph  # Modified return
 
 
 def build_networkx_graph(network, down_nodes):
@@ -185,12 +188,24 @@ def get_powered_nodes(network, down_nodes):
 
 
 def set_node_down(network, node):
-    """
-    Mark a node as 'down' by zeroing out its load. Keep the bus in the network for visualization.
-    """
-    for load_name in network.loads.index:
-        if network.loads.at[load_name, "bus"] == node:
-            network.loads.at[load_name, "p_set"] = 0.0
+    # Disconnect lines
+    lines_to_disable = network.lines[
+        (network.lines.bus0 == node) | (network.lines.bus1 == node)
+    ].index
+    network.lines.loc[lines_to_disable, "in_service"] = False
+
+    # Disconnect transformers
+    trafos_to_disable = network.transformers[
+        (network.transformers.bus0 == node) | (network.transformers.bus1 == node)
+    ].index
+    network.transformers.loc[trafos_to_disable, "in_service"] = False
+
+    # Zero out loads (critical for accurate power flow)
+    network.loads.loc[network.loads.bus == node, "p_set"] = 0
+
+    # Optional: Set bus itself as out of service (if supported by PyPSA)
+    if "in_service" in network.buses.columns:
+        network.buses.loc[node, "in_service"] = False
 
 
 def set_node_up(network, node):
@@ -230,68 +245,65 @@ def check_impedance(network):
 
 
 
-def add_buildings_from_poly(network, poly_file="osm.poly.xml"):
-    """Add buildings from SUMO poly file using raw UTM coordinates"""
+def add_buildings_from_poly(network, poly_file="osm.poly.xml", max_buildings=50):
+    """Add a limited number of randomly selected buildings from poly file"""
     import xml.etree.ElementTree as ET
     from shapely.geometry import Polygon
-    import math
+    import random
 
     tree = ET.parse(poly_file)
     root = tree.getroot()
 
-    # Process buildings
-    building_coords = []
+    # First collect all valid buildings
+    all_buildings = []
     for poly_elem in root.findall('poly'):
         if not poly_elem.get('type', '').startswith('building'):
             continue
 
         shape_str = poly_elem.get('shape')
-        if not shape_str:
+        if not shape_str or len(shape_str.split()) < 4:
             continue
 
-        coords = [tuple(map(float, p.split(','))) for p in shape_str.split()]
-
-        # Validate coordinates
-        if len(coords) < 4:
-            continue
-
-        # Create polygon directly from UTM coordinates
         try:
-            utm_poly = Polygon(coords)
-            if not utm_poly.is_valid:
-                continue
-            centroid = utm_poly.centroid
-        except Exception as e:
-            print(f"Skipping invalid building {poly_elem.get('id')}: {str(e)}")
+            coords = [tuple(map(float, p.split(','))) for p in shape_str.split()]
+            poly = Polygon(coords)
+            if poly.is_valid:
+                all_buildings.append((poly_elem.get('id'), poly.centroid))
+        except Exception:
             continue
 
-        # Add to network with raw UTM coordinates
-        building_id = f"BLD{poly_elem.get('id')}"
-        network.add("Bus", building_id, v_nom=0.4,
-                   x=centroid.x,  # Direct UTM X
-                   y=centroid.y)  # Direct UTM Y
+    # Randomly select up to max_buildings
+    selected_buildings = random.sample(all_buildings, min(max_buildings, len(all_buildings)))
 
-        network.add("Load", f"load_{building_id}", bus=building_id,
-                   p_set=np.random.uniform(0.005, 0.02))
+    for building_id, centroid in selected_buildings:
+        # Add to network
+        bus_id = f"BLD{building_id}"
+        network.add("Bus",
+                   name=bus_id,
+                   v_nom=0.4,
+                   x=centroid.x,
+                   y=centroid.y)
 
-        # Connect to grid with TRANSFORMER (20kV -> 0.4kV)
+        network.add("Load",
+                   name=f"load_{bus_id}",
+                   bus=bus_id,
+                   p_set=np.random.uniform(0.5, 2.0))  # 500-2000 kW
+
+        # Connect to nearest 20kV node
         min_dist = float('inf')
         nearest_bus = None
         for bus in network.buses.index:
-            if network.buses.at[bus, 'v_nom'] == 20:  # Traffic nodes are 20kV
-                dx = network.buses.at[bus, 'x'] - centroid.x
-                dy = network.buses.at[bus, 'y'] - centroid.y
-                dist = math.hypot(dx, dy)
+            if network.buses.at[bus, 'v_nom'] == 20:
+                dist = math.hypot(network.buses.at[bus, 'x'] - centroid.x,
+                                 network.buses.at[bus, 'y'] - centroid.y)
                 if dist < min_dist:
                     min_dist = dist
                     nearest_bus = bus
 
         if nearest_bus:
-            network.add(
-                "Transformer",
-                f"trafo_{building_id}",
-                bus0=nearest_bus,
-                bus1=building_id,
-                x=0.05,  # 5% reactance
-                s_nom=0.1  # 100 kVA
-            )
+            network.add("Transformer",
+                       name=f"trafo_{bus_id}",
+                       bus0=nearest_bus,
+                       bus1=bus_id,
+                       x=0.05,
+                       s_nom=5.0)
