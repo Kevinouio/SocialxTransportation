@@ -25,8 +25,12 @@ from powerNetworkGen import (
     set_node_up,
     check_network_connectivity,
     check_impedance,
-    add_buildings_from_poly
+    add_buildings_from_poly,
+    ensure_network_connectivity,
+    network_diagnostics,
+    sanitize_network
 )
+
 logging.getLogger("pypsa").setLevel(logging.ERROR)
 logging.getLogger("pypsa.pf").setLevel(logging.CRITICAL)
 os.environ["PROJ_LIB"] = r"C:\\Users\\kth258\\AppData\\Local\\anaconda3\\envs\\sot\\Library\\share\\proj"
@@ -36,28 +40,23 @@ os.environ["PROJ_LIB"] = r"C:\\Users\\kth258\\AppData\\Local\\anaconda3\\envs\\s
 # POWER FLOW
 ############################
 def run_power_flow(network):
-    """Run power flow after validating connectivity."""
-    # Check for islands and assign slack buses
-    G = build_networkx_graph(network, down_nodes=set())
-    components = list(nx.connected_components(G))
+    # Before power flow, ensure sufficient generation capacity
+    total_load = network.loads_t.p_set.sum().sum()
 
-    for comp in components:
-        has_slack = any(network.generators.loc[gen, "control"] == "Slack"
-                        for gen in network.generators.index
-                        if network.generators.at[gen, "bus"] in comp)
-        if not has_slack:
-            # Assign a slack bus to the island
-            candidate_bus = next(iter(comp))
-            network.add("Generator", name=f"Slack_{candidate_bus}",
-                        bus=candidate_bus, p_nom=1e3, control="Slack")
-            print(f"Added slack bus to island containing {candidate_bus}")
+    # Add/update main slack generator
+    if "MainSlack" not in network.generators.index:
+        network.add("Generator", "MainSlack",
+                    bus="MainPowerGrid",
+                    p_nom=max(200000, total_load * 1.5),  # 50% safety margin
+                    control="Slack",
+                    marginal_cost=10)
+    else:
+        network.generators.at["MainSlack", "p_nom"] = max(200000, total_load * 1.5)
 
-    # Proceed with power flow
-    try:
-        network.lpf()
-        network.pf()
-    except Exception as e:
-        print(f"Power flow failed: {e}")
+    # Remove zero-capacity generators
+    invalid_gens = network.generators[network.generators.p_nom <= 0].index
+    network.remove("Generator", invalid_gens.tolist())
+
 
 ############################
 # EV CHARGING STATION
@@ -152,110 +151,27 @@ def add_ev_charging_station(
 ############################
 
 def connect_buildings_to_grid(network):
-    """
-    Connects all building buses (0.4kV) to the closest existing nodes
-    in the main power network (20kV) using transformers.
-    """
-    # Get all building buses and main network buses
+    """Ensure ALL buildings are properly connected"""
     building_buses = network.buses[network.buses.v_nom == 0.4].index
     main_buses = network.buses[network.buses.v_nom == 20].index
 
-    # Dictionary to track existing connections to avoid duplicates
-    existing_connections = set()
-
     for building in building_buses:
-        # Skip already connected buildings
-        if f"Trafo_{building}" in network.transformers.index:
-            continue
+        # Force connection to nearest 3 buses for redundancy
+        distances = []
+        for mb in main_buses:
+            dx = network.buses.at[mb, 'x'] - network.buses.at[building, 'x']
+            dy = network.buses.at[mb, 'y'] - network.buses.at[building, 'y']
+            distances.append((mb, math.hypot(dx, dy)))
 
-        min_dist = float('inf')
-        nearest_bus = None
-
-        # Find closest main network bus
-        for main_bus in main_buses:
-            try:
-                dx = network.buses.at[main_bus, 'x'] - network.buses.at[building, 'x']
-                dy = network.buses.at[main_bus, 'y'] - network.buses.at[building, 'y']
-                dist = math.hypot(dx, dy)
-
-                if dist < min_dist and (main_bus, building) not in existing_connections:
-                    min_dist = dist
-                    nearest_bus = main_bus
-            except KeyError:
-                continue
-
-        if nearest_bus:
-            # Add transformer between main network and building
-            network.add(
-                "Transformer",
-                name=f"Trafo_{building}",
-                bus0=nearest_bus,
-                bus1=building,
-                x=0.05,  # 5% reactance
-                s_nom=0.1,  # 100 kVA
-                tap_ratio=1.0
-            )
-            existing_connections.add((nearest_bus, building))
-            print(f"Connected {building} to {nearest_bus} (distance: {min_dist:.1f}m)")
-
-
-def visualize_network_state_poly(network, down_nodes, time_step=0):
-    plt.figure(figsize=(14, 10))
-    G = nx.Graph()
-
-    # Add nodes with relative positions
-    all_x = []
-    all_y = []
-    for bus in network.buses.index:
-        if bus in down_nodes:
-            continue
-        x = network.buses.at[bus, 'x']
-        y = network.buses.at[bus, 'y']
-        all_x.append(x)
-        all_y.append(y)
-        node_size = 300 if 'BLD' in bus else 100
-        node_color = 'blue' if 'BLD' in bus else 'green'
-        G.add_node(bus, size=node_size, color=node_color)
-
-    # Calculate plot center
-    plot_center_x = (max(all_x) + min(all_x)) / 2
-    plot_center_y = (max(all_y) + min(all_y)) / 2
-
-    # Create relative positions (meters from center)
-    pos = {
-        bus: (
-            network.buses.at[bus, 'x'] - plot_center_x,
-            network.buses.at[bus, 'y'] - plot_center_y
-        )
-        for bus in G.nodes
-    }
-
-    # Draw nodes and edges
-    nx.draw(G, pos, node_size=[G.nodes[bus]['size'] for bus in G.nodes],
-            node_color=[G.nodes[bus]['color'] for bus in G.nodes],
-            edge_color='gray', with_labels=True, font_size=8)
-
-    # Use raw UTM coordinates
-    pos = {bus: (network.buses.at[bus, 'x'], network.buses.at[bus, 'y'])
-           for bus in G.nodes()}
-
-    # Set axis labels in kilometers
-    # Fixed version
-    node_list = list(G.nodes())
-    all_x = network.buses.x[node_list]
-    all_y = network.buses.y[node_list]
-
-    plt.xlim(min(all_x) - 100, max(all_x) + 100)  # 100m buffer
-    plt.ylim(min(all_y) - 100, max(all_y) + 100)
-
-    plt.gca().set_aspect('equal')
-    plt.xlabel("UTM Easting (m)")
-    plt.ylabel("UTM Northing (m)")
-
-    plt.title(f"Network State - Hour {time_step + 1}")
-    plt.savefig(f"network_visuals/hour_{time_step + 1:02d}.png")
-    plt.close()
-
+        # Connect to 3 nearest buses
+        for mb, _ in sorted(distances, key=lambda x: x[1])[:3]:
+            network.add("Transformer",
+                        name=f"Trafo_{building}_{mb}",
+                        bus0=mb,
+                        bus1=building,
+                        x=0.05,
+                        s_nom=0.2  # 200 kVA capacity
+                        )
 
 # Updated visualize_network_state (add transformers)
 def visualize_network_state(network, down_nodes, time_step=0):
@@ -265,8 +181,17 @@ def visualize_network_state(network, down_nodes, time_step=0):
 
     # Add nodes
     for bus in network.buses.index:
-        node_size = 300 if 'BLD' in bus else 100
-        node_color = 'blue' if 'BLD' in bus else ('red' if bus in down_nodes else 'green')
+        # New EV station detection (purple)
+        if "EVStation" in bus:
+            node_color = 'purple'
+            node_size = 400  # Larger size for visibility
+        elif 'BLD' in bus:
+            node_color = 'blue'
+            node_size = 300
+        else:
+            node_color = 'red' if bus in down_nodes else 'green'
+            node_size = 100
+
         G.add_node(bus, size=node_size, color=node_color)
 
     # Add both lines AND transformers
@@ -307,6 +232,7 @@ def visualize_network_state(network, down_nodes, time_step=0):
               f"Buildings: {len([b for b in network.buses.index if 'BLD' in b])}")
     plt.savefig(f"network_visuals/combined_hour_{time_step + 1:02d}.png")
     plt.close()
+
 
 ############################
 # LARGE-SCALE / PARTITION FAILURES
@@ -412,6 +338,51 @@ def debug_node_coordinates(network):
     print(f"- Buildings: {building_count}")
     print(f"- Other Infrastructure: {other_count}")
     print("=" * 70 + "\n")
+
+def pre_flow_checks(network):
+    """Essential network validation"""
+    # Check for disconnected components
+    G = network.graph()
+    if not nx.is_connected(G):
+        print("⚠️ Network has disconnected components!")
+        components = list(nx.connected_components(G))
+        print(f"Found {len(components)} islands")
+
+    # Verify impedance values
+    invalid_lines = network.lines[(network.lines.r <= 0) | (network.lines.x <= 0)]
+    if not invalid_lines.empty:
+        print("🚫 Invalid line parameters:")
+        print(invalid_lines[['r', 'x']])
+
+    # Check voltage levels
+    if network.buses.v_nom.isnull().any():
+        print("❌ Missing voltage levels on buses:")
+        print(network.buses[network.buses.v_nom.isnull()])
+
+    # Check for NaN in loads
+    if network.loads_t.p_set.isnull().any().any():
+        print("⚠️ NaN values in loads! Sanitizing...")
+        network.loads_t.p_set = network.loads_t.p_set.fillna(0)
+
+    # Verify bus names
+    invalid_buses = network.buses.index[network.buses.index.isin(['', 'nan'])]
+    if not invalid_buses.empty:
+        print(f"⚠️ Found {len(invalid_buses)} invalid buses! Reindexing...")
+        new_index = [f"Bus_{i}" if b in ['', 'nan'] else b for i, b in enumerate(network.buses.index)]
+        network.buses.index = new_index
+
+
+
+
+
+
+
+
+
+
+
+
+
 ############################
 # LOGGING
 ############################
@@ -425,15 +396,14 @@ def initialize_power_flow_log_df(network):
 
 
 def append_power_flow_log_df(network, df, t):
-    """
-    Runs a power flow on the network, extracts the voltage magnitudes,
-    and appends them as a new column labeled "T=t" in the DataFrame.
-    """
+    """Runs power flow and appends voltages with clamping"""
     run_power_flow(network)
     if network.buses_t.v_mag_pu.empty:
         print(f"No voltage data available at time T={t}.")
         return df
-    last_v = network.buses_t.v_mag_pu.iloc[-1]
+
+    # Clamp voltages to realistic range
+    last_v = network.buses_t.v_mag_pu.iloc[-1].clip(0.8, 1.2)  # <-- Added clamp
     df[f"T={t}"] = last_v
     return df
 
@@ -632,6 +602,7 @@ def simulate_local_failure(network, original_graph, failed_node, depth, failure_
 
     return to_fail
 
+
 ############################
 # MAIN SIMULATION
 ############################
@@ -644,13 +615,13 @@ def run_combined_simulation():
     network, sumo_to_label, label_to_sumo, _ = create_power_network(
         traffic_light_nodes,
         road_edges,
-        feeders=3
+        feeders=6
     )
+    ensure_network_connectivity(network)
 
     # 2. Add buildings from poly file
 
-
-    # 3. Connect buildings to closest traffic nodes
+    # 3. Connect buildings to the closest traffic nodes
     connect_buildings_to_grid(network)
     debug_node_coordinates(network)
 
@@ -663,9 +634,18 @@ def run_combined_simulation():
     network.set_snapshots(range(total_steps))
     add_buildings_from_poly(network, "osm.poly.xml")
 
+    # Add capacitor banks to strategic locations
+    for bus in ["LocalSubstation", "N30", "N150"]:
+        network.add("ShuntImpedance",
+                    name=f"CapBank_{bus}",
+                    bus=bus,
+                    r=1e6,  # Mostly reactive
+                    x=-40  # Capacitive reactance
+                    )
+
     # Create realistic EV load profile (peaks at midday)
     time_array = np.linspace(0, 2 * np.pi, total_steps)
-    ev_load_profile_mw = 20 + 100 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
+    ev_load_profile_mw = 200 + 100 * np.cos(time_array - np.pi / 2) ** 2  # 100-300 kW load
     ev_load_profile = pd.Series(ev_load_profile_mw * 1000,  # kW
                                 index=network.snapshots)
 
@@ -689,8 +669,12 @@ def run_combined_simulation():
     # 8. Main simulation loop
     for t in network.snapshots:
         print(f"\n=== Combined Network - Hour {t + 1} ===")
+        network_diagnostics(network)
+        sanitize_network(network)
+        ensure_network_connectivity(network)
 
         try:
+            pre_flow_checks(network)
             run_power_flow(network)
         except Exception as e:
             print(f"Power flow failed: {str(e)[:100]}")
@@ -717,7 +701,8 @@ def run_manual_failure_simulation():
     network_file = "osm.net.xml"
     traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
     road_edges = get_road_edges_from_sumo(network_file)
-    network, sumo_to_label, label_to_sumo, original_graph = create_power_network(traffic_light_nodes, road_edges, feeders=3)
+    network, sumo_to_label, label_to_sumo, original_graph = create_power_network(traffic_light_nodes, road_edges,
+                                                                                 feeders=3)
     add_buildings_from_poly(network, "osm.poly.xml")
 
     # Initialize logging and tracking
@@ -815,8 +800,7 @@ def run_manual_failure_simulation():
         print("\nFinal network state:")
         debug_node_coordinates(network)
 
+
 # Update the main block to use this new simulation
 if __name__ == "__main__":
     run_combined_simulation()
-
-

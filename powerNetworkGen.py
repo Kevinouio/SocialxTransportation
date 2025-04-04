@@ -8,6 +8,7 @@ import pandas as pd
 
 os.environ["PROJ_LIB"] = r"C:\Users\kth258\AppData\Local\anaconda3\envs\sot\Library\share\proj"
 
+
 def add_ev_charging_station(
         network: pypsa.Network,
         station_name: str,
@@ -91,6 +92,7 @@ def add_ev_charging_station(
         q_set=0.0,  # Set Q to 0 or your desired reactive load
     )
 
+
 def get_traffic_lights_from_sumo(network_file):
     """
     Extracts traffic lights from a SUMO .net.xml file as {id: (x, y)}.
@@ -145,16 +147,15 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
     network.add("Bus", name="LocalSubstation", v_nom=20, x=60, y=50)
     # Transformer 230 -> 20 kV
     network.add(
-        "Line",
-        "Line_MPG_LS",  # example
+        "Transformer",
+        "Trans_230kV_20kV",
         bus0="MainPowerGrid",
         bus1="LocalSubstation",
-        length=1.0,
-        r=0.5,  # small but non-zero
-        x=0.9,
-        s_nom=100
+        x=0.1,  # 10% reactance
+        s_nom=200,  # 200 MVA capacity
+        tap_ratio=1.0,
+        phase_shift=0
     )
-
     # Assign short labels to traffic lights
     sumo_to_label = {}
     label_to_sumo = {}
@@ -177,21 +178,31 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
             name=f"Feeder_{feed_l}",
             bus0="LocalSubstation",
             bus1=feed_l,
-            length=0.1,
-            r=0.1,
-            x=0.9,
-            r_per_length=0.0003,  # More realistic R
-            x_per_length=0.0004
+            x=0.05,  # 0.05Ω/km reactance
+            r=0.08,  # 0.08Ω/km resistance
+            s_nom=50,  # 50 MVA capacity
+            length=1.0  # 1km lines
         )
 
     # Connect traffic lights with lines based on road edges
     # Use a bit higher impedances for distribution lines
     r_per_m = 0.0003
     x_per_m = 0.0004
+    line_counter = {}  # Track duplicate connections
+
     for (s_from, s_to) in road_edges:
         if s_from in sumo_to_label and s_to in sumo_to_label:
             from_label = sumo_to_label[s_from]
             to_label = sumo_to_label[s_to]
+
+            # Create unique key for connection
+            connection_key = frozenset({from_label, to_label})
+
+            # Count occurrences
+            line_counter[connection_key] = line_counter.get(connection_key, 0) + 1
+            suffix = f"_{line_counter[connection_key]}" if line_counter[connection_key] > 1 else ""
+
+            # Calculate distance
             (x1, y1) = traffic_light_nodes[s_from]
             (x2, y2) = traffic_light_nodes[s_to]
             dist_m = math.hypot(x2 - x1, y2 - y1)
@@ -199,7 +210,7 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
 
             network.add(
                 "Line",
-                name=f"{from_label}-{to_label}",
+                name=f"{from_label}-{to_label}{suffix}",  # Unique name
                 bus0=from_label,
                 bus1=to_label,
                 length=dist_km,
@@ -230,27 +241,27 @@ def create_power_network(traffic_light_nodes, road_edges, feeders=2):
 
 
 def build_networkx_graph(network, down_nodes):
-    """
-    Build a NetworkX graph from PyPSA lines + transformers,
-    ignoring any node in 'down_nodes'.
-    """
+    """Build NetworkX graph with hashable string nodes"""
     G = nx.Graph()
-    for bus in network.buses.index:
-        if bus in down_nodes:
-            continue
-        G.add_node(bus)
 
-    # Lines
+    # Convert all buses to strings
+    for bus in network.buses.index:
+        bus_str = str(bus)
+        if bus_str in down_nodes:
+            continue
+        G.add_node(bus_str)
+
+    # Process lines
     for line_name in network.lines.index:
-        b0 = network.lines.at[line_name, "bus0"]
-        b1 = network.lines.at[line_name, "bus1"]
+        b0 = str(network.lines.at[line_name, "bus0"])
+        b1 = str(network.lines.at[line_name, "bus1"])
         if b0 not in down_nodes and b1 not in down_nodes:
             G.add_edge(b0, b1)
 
-    # Transformers
+    # Process transformers
     for trafo_name in network.transformers.index:
-        b0 = network.transformers.at[trafo_name, "bus0"]
-        b1 = network.transformers.at[trafo_name, "bus1"]
+        b0 = str(network.transformers.at[trafo_name, "bus0"])
+        b1 = str(network.transformers.at[trafo_name, "bus1"])
         if b0 not in down_nodes and b1 not in down_nodes:
             G.add_edge(b0, b1)
 
@@ -349,7 +360,73 @@ def check_impedance(network):
         print(f"Line {line}: r={r} x={x} | r_per_length={r_per_length} x_per_length={x_per_length}")
 
 
-# --- Modified function in powerNetworkGen.py ---
+def ensure_network_connectivity(network):
+    """Aggressive network connectivity enforcement"""
+    G = network.graph()
+    islands = list(nx.connected_components(G))
+
+    # Connect all islands to main grid
+    main_bus = "MainPowerGrid"
+    for island in islands[1:]:  # Skip first (main) island
+        island_bus = next(iter(island))
+        print(f"⚡ Connecting island at {island_bus} to main grid")
+        network.add("Line",
+                    f"Bridge_{island_bus}",
+                    bus0=main_bus,
+                    bus1=island_bus,
+                    x=0.001,  # Low reactance virtual connection
+                    r=0.001,
+                    s_nom=10000)  # High capacity virtual line
+
+    # Remove duplicate connections
+    seen = set()
+    for line in network.lines.index:
+        buses = frozenset([network.lines.at[line, "bus0"],
+                           network.lines.at[line, "bus1"]])
+        if buses in seen:
+            network.remove("Line", line)
+        seen.add(buses)
+
+
+def sanitize_network(network):
+    """Clean network data with pandas-safe operations"""
+    # Fix bus names
+    network.buses.index = network.buses.index.astype(str).str.strip().replace('', 'MissingBus')
+    network.buses.index = network.buses.index.where(
+        network.buses.index != 'nan', 'MissingBus'
+    )
+
+    # Fix coordinates using .loc for safe assignment
+    network.buses.loc[:, 'x'] = network.buses['x'].fillna(0)
+    network.buses.loc[:, 'y'] = network.buses['y'].fillna(0)
+
+    # Fix line parameters
+    network.lines.loc[:, 'r'] = network.lines['r'].fillna(0.1)
+    network.lines.loc[:, 'x'] = network.lines['x'].fillna(0.3)
+    network.lines.loc[:, 's_nom'] = network.lines['s_nom'].fillna(100)
+
+def network_diagnostics(network):
+    """Comprehensive network health check"""
+    print("\n=== Network Diagnostics ===")
+
+    # Check connectivity
+    G = network.graph()
+    islands = list(nx.connected_components(G))
+    print(f"Connected components: {len(islands)}")
+
+    # Voltage levels
+    print("\nVoltage levels (kV):")
+    print(network.buses.v_nom.value_counts())
+
+    # Line parameters
+    print("\nLine parameters summary:")
+    print(network.lines[['r', 'x', 's_nom']].describe())
+
+    # Load/generation balance
+    total_load = network.loads_t.p_set.sum().sum()
+    total_gen = network.generators_t.p_set.sum().sum()
+    print(f"\nLoad/Gen Balance: {total_load:.1f} MW / {total_gen:.1f} MW")
+
 
 def add_buildings_from_poly(network, poly_file="osm.poly.xml", max_buildings=50):
     """
@@ -417,26 +494,25 @@ def add_buildings_from_poly(network, poly_file="osm.poly.xml", max_buildings=50)
         # First 2 become EV stations
         if ev_stations_added < 2:
             # Add EV station using dedicated function
-            time_array = np.linspace(0, 2 * np.pi, 24)
-            ev_load_profile_mw = 1000 + 70 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
-            ev_load_profile = pd.Series(ev_load_profile_mw * 1000,  # kW
-                                        index=network.snapshots)
-
+            time_array = np.linspace(0, 2 * np.pi, len(network.snapshots))
+            ev_load_profile_mw = 1000 + 3000 * np.cos(time_array - np.pi / 2) ** 2
+            ev_load_profile = pd.Series(
+                ev_load_profile_mw * 1000,
+                index=network.snapshots
+            )
 
             add_ev_charging_station(
                 network=network,
                 station_name=f"EV_Station_{ev_stations_added + 1}",
                 connect_to_bus="LocalSubstation",
                 bus_coords=(x, y),
-                line_rating_mva=35,  # Keep existing line rating
-                line_resistance_per_km=0.003,  # Realistic values for 20kV lines
-                line_reactance_per_km=0.007,
+                line_rating_mva=1000,
+                line_resistance_per_km=0.01,
+                line_reactance_per_km=0.02,
                 ev_load_profile_kw=ev_load_profile
             )
-
-
             ev_stations_added += 1
-            continue  # Skip normal building processing
+            continue
 
         # Regular building setup
         bus_id = f"BLD_{building['id']}"

@@ -23,7 +23,8 @@ from powerNetwork import (
     append_power_flow_log_df,
     save_power_flow_log_df,
     set_node_down,
-    set_node_up
+    set_node_up,
+    add_ev_charging_station
 )
 
 
@@ -51,24 +52,27 @@ def main():
     road_edges = get_road_edges_from_sumo(traffic_network_file)
     power_network, sumo_to_label, label_to_sumo, _ = create_power_network(traffic_light_nodes, road_edges, feeders=3)
 
-    # Add buildings and EV stations with high load
+    # Set up temporal parameters FIRST
+    total_steps = 24
+    power_network.set_snapshots(range(total_steps))
+
+    # Now add buildings and EV stations with time-aware profiles
     add_buildings_from_poly(power_network, "osm.poly.xml")
 
-    # Configure EV station parameters
+    # Configure massive EV load to trigger voltage drops
     n30_coords = (power_network.buses.at["N30", "x"], power_network.buses.at["N30", "y"])
-    time_array = np.linspace(0, 2 * np.pi, 24)
-    ev_load_profile_mw = 100 + 500 * np.cos(time_array - np.pi / 2) ** 2  # 100-600MW peak
+    time_array = np.linspace(0, 2 * np.pi, total_steps)
+    ev_load_profile_mw = 500 + 1500 * np.cos(time_array - np.pi / 2) ** 2  # 500-2000MW peak
 
-    from powerNetwork import add_ev_charging_station
     add_ev_charging_station(
         power_network,
         station_name="EVStation1",
         connect_to_bus="N30",
-        ev_load_profile_kw=pd.Series(ev_load_profile_mw * 1000, index=range(24)),
+        ev_load_profile_kw=pd.Series(ev_load_profile_mw * 1000, index=power_network.snapshots),
         bus_coords=(n30_coords[0] + 2, n30_coords[1] + 2),
-        line_rating_mva=100,
-        line_resistance_per_km=0.005,
-        line_reactance_per_km=0.01
+        line_rating_mva=500,  # Increased capacity
+        line_resistance_per_km=0.01,
+        line_reactance_per_km=0.03
     )
 
     # Initialize tracking
