@@ -220,12 +220,16 @@ def visualize_network_state(network, down_nodes, time_step=0):
         with_labels=True,
         font_size=8
     )
+    image = mpimg.imread('Manhattan.PNG')
+
 
     # Set axis limits
     all_x = [network.buses.at[bus, 'x'] for bus in G.nodes()]
     all_y = [network.buses.at[bus, 'y'] for bus in G.nodes()]
     plt.xlim(min(all_x) - 100, max(all_x) + 100)
     plt.ylim(min(all_y) - 100, max(all_y) + 100)
+
+    plt.imshow(image, extent=[min(all_x) - 100, max(all_x) + 100, min(all_y) - 100, max(all_y) + 100], aspect='auto', zorder=0)
 
     plt.title(f"Combined Network State - Hour {time_step + 1}\n"
               f"Traffic Nodes: {len([b for b in network.buses.index if 'N' in b])} | "
@@ -669,9 +673,7 @@ def run_combined_simulation():
     # 8. Main simulation loop
     for t in network.snapshots:
         print(f"\n=== Combined Network - Hour {t + 1} ===")
-        network_diagnostics(network)
-        sanitize_network(network)
-        ensure_network_connectivity(network)
+
 
         try:
             pre_flow_checks(network)
