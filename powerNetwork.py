@@ -36,28 +36,28 @@ os.environ["PROJ_LIB"] = r"C:\\Users\\kth258\\AppData\\Local\\anaconda3\\envs\\s
 # POWER FLOW
 ############################
 def run_power_flow(network):
-    """
-    Attempts a power flow with Q-limits disabled, then a normal .pf() call
-    without initial_solution (for older PyPSA versions).
-    """
-    if network.generators.empty:
-        print("⚠️ No generator. Skipping power flow.")
-        return
+    """Run power flow after validating connectivity."""
+    # Check for islands and assign slack buses
+    G = build_networkx_graph(network, down_nodes=set())
+    components = list(nx.connected_components(G))
 
+    for comp in components:
+        has_slack = any(network.generators.loc[gen, "control"] == "Slack"
+                        for gen in network.generators.index
+                        if network.generators.at[gen, "bus"] in comp)
+        if not has_slack:
+            # Assign a slack bus to the island
+            candidate_bus = next(iter(comp))
+            network.add("Generator", name=f"Slack_{candidate_bus}",
+                        bus=candidate_bus, p_nom=1e3, control="Slack")
+            print(f"Added slack bus to island containing {candidate_bus}")
+
+    # Proceed with power flow
     try:
-        # 1) Turn off Q-limits to avoid reactive constraints
-        network.enforce_Q_limits = False
-
-        # 2) Attempt a linear load flow warm-start
         network.lpf()
-
-        # 3) Nonlinear PF but remove 'initial_solution' argument for older versions
         network.pf()
-        # If partial islands or lines are too small, you might still see warnings.
-
     except Exception as e:
-        print(f"⚠️ PF failed: {e}")
-
+        print(f"Power flow failed: {e}")
 
 ############################
 # EV CHARGING STATION
@@ -641,14 +641,14 @@ def run_combined_simulation():
     network_file = "osm.net.xml"
     traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
     road_edges = get_road_edges_from_sumo(network_file)
-    network, sumo_to_label, label_to_sumo = create_power_network(
+    network, sumo_to_label, label_to_sumo, _ = create_power_network(
         traffic_light_nodes,
         road_edges,
         feeders=3
     )
 
     # 2. Add buildings from poly file
-    add_buildings_from_poly(network, "osm.poly.xml")
+
 
     # 3. Connect buildings to closest traffic nodes
     connect_buildings_to_grid(network)
@@ -661,10 +661,11 @@ def run_combined_simulation():
     # 5. Set up temporal parameters
     total_steps = 24
     network.set_snapshots(range(total_steps))
+    add_buildings_from_poly(network, "osm.poly.xml")
 
     # Create realistic EV load profile (peaks at midday)
     time_array = np.linspace(0, 2 * np.pi, total_steps)
-    ev_load_profile_mw = 10 + 70 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
+    ev_load_profile_mw = 20 + 100 * np.cos(time_array - np.pi / 2) ** 2  # 10-50MW load
     ev_load_profile = pd.Series(ev_load_profile_mw * 1000,  # kW
                                 index=network.snapshots)
 
@@ -683,7 +684,7 @@ def run_combined_simulation():
 
     # 7. Initialize failure tracking
     failed_buses = set()
-    voltage_threshold = 0.88  # ANSI standard
+    voltage_threshold = 0.80  # ANSI standard
 
     # 8. Main simulation loop
     for t in network.snapshots:
@@ -716,72 +717,92 @@ def run_manual_failure_simulation():
     network_file = "osm.net.xml"
     traffic_light_nodes = get_traffic_lights_from_sumo(network_file)
     road_edges = get_road_edges_from_sumo(network_file)
-    network, sumo_to_label, label_to_sumo, original_graph  = create_power_network(traffic_light_nodes, road_edges, feeders=3)
+    network, sumo_to_label, label_to_sumo, original_graph = create_power_network(traffic_light_nodes, road_edges, feeders=3)
     add_buildings_from_poly(network, "osm.poly.xml")
 
-    # Initialize logging
+    # Initialize logging and tracking
     voltage_log = initialize_power_flow_log_df(network)
     current_step = 0
-    failed_nodes = set()
+    failed_nodes = {}  # {node_id: remaining_downtime_steps}
+    failure_duration = 5  # Default recovery after 5 steps
 
     try:
         while True:
-            # Run power flow and log voltages
+            # 1. Automatic node recovery check
+            to_remove = []
+            for node in list(failed_nodes.keys()):
+                failed_nodes[node] -= 1
+                if failed_nodes[node] <= 0:
+                    to_remove.append(node)
+
+            for node in to_remove:
+                del failed_nodes[node]
+                set_node_up(network, node, failed_nodes)
+                print(f"\n🔌 Node {node} automatically restored after downtime")
+
+            # 2. Run power flow and log voltages
             try:
                 run_power_flow(network)
                 voltage_log = append_power_flow_log_df(network, voltage_log, current_step)
             except Exception as e:
                 print(f"Power flow calculation failed: {str(e)[:50]}")
 
-            # Visualization
-            visualize_network_state(network, failed_nodes, current_step)
+            # 3. Visualization
+            visualize_network_state(network, failed_nodes.keys(), current_step)
 
-            # Display interface
+            # 4. User interface
             print("\n" + "=" * 40)
-            print(f"STEP {current_step} - Voltage log saved")
-            print(f"Failed nodes: {failed_nodes or 'None'}")
+            print(f"STEP {current_step} - Active failures: {failed_nodes}")
+            print("[f]ail node, [r]ecover node, [v]iew log, [q]uit")
 
-            # User control
-            action = input("[f]ail node, [r]ecover node, [v]iew log, [q]uit: ").lower()
+            action = input("Action: ").lower()
 
-            # In the failure handling section:
+            # 5. Handle user actions
             if action == 'f':
-                # PROPERLY DEFINE AVAILABLE NODES FIRST
                 available = [n for n in network.buses.index
                              if n not in failed_nodes
                              and n not in ["MainPowerGrid", "LocalSubstation"]]
+
+                if not available:
+                    print("No nodes available for failure")
+                    continue
 
                 print("\nAvailable nodes:", available)
                 node = input("Node ID to fail: ").strip()
 
                 if node in available:
                     try:
-                        depth = int(input("Failure depth (network hops, 0-3): "))
+                        duration = int(
+                            input(f"Failure duration (current default {failure_duration}): ") or failure_duration)
                     except ValueError:
-                        depth = 0
+                        duration = failure_duration
 
-                    depth = max(0, min(3, depth))  # Limit to 0-3 hops
-
-                    # Fail main node
+                    # Set node failure
+                    failed_nodes[node] = duration
                     set_node_down(network, node)
-                    failed_nodes.add(node)
 
-                    # Fail local nodes
-                    if depth > 0:
-                        local_failures = simulate_local_failure(network, original_graph, node, depth)
-                        failed_nodes.update(local_failures)
-                        print(f"Failed {len(local_failures)} nodes within {depth} hops")
+                    # Optional cascading failure
+                    try:
+                        depth = int(input("Cascade failure depth (0-3): ") or 0)
+                        depth = max(0, min(3, depth))
+                        if depth > 0:
+                            local_failures = simulate_local_failure(network, original_graph, node, depth)
+                            for fn in local_failures:
+                                failed_nodes[fn] = duration  # Same duration as main failure
+                    except:
+                        pass
 
             elif action == 'r' and failed_nodes:
-                print("Failed nodes:", failed_nodes)
+                print("Failed nodes:", list(failed_nodes.keys()))
                 node = input("Node ID to recover: ").strip()
                 if node in failed_nodes:
-                    failed_nodes.remove(node)
-                    set_node_up(network, node)
+                    del failed_nodes[node]
+                    set_node_up(network, node, failed_nodes)
+                    print(f"Node {node} manually restored")
 
             elif action == 'v':
-                print("\nCurrent Voltage Log:")
-                print(voltage_log.tail(3))  # Show last 3 entries
+                print("\nVoltage log summary:")
+                print(voltage_log.tail(3))
 
             elif action == 'q':
                 break
@@ -789,14 +810,13 @@ def run_manual_failure_simulation():
             current_step += 1
 
     finally:
-        # Save final log
+        # Save final state
         save_power_flow_log_df(voltage_log, "manual_simulation_voltages.csv")
-        print("\nVoltage log saved to manual_simulation_voltages.csv")
-        print("Final network state:")
+        print("\nFinal network state:")
         debug_node_coordinates(network)
 
 # Update the main block to use this new simulation
 if __name__ == "__main__":
-    run_manual_failure_simulation()
+    run_combined_simulation()
 
 
