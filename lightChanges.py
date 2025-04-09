@@ -36,4 +36,4 @@ def run_simulation_all_red(net_file, route_file):
         print("Simulation ended.")
 
 if __name__ == "__main__":
-    run_simulation_all_red("osm.net.xml", "osm.rou.xml")
+    run_simulation_all_red("power_visuals/osm.net.xml", "power_visuals/osm.rou.xml")

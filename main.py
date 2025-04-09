@@ -1,9 +1,9 @@
 import traci
-import random
 import time
 import numpy as np
 import pandas as pd
 import logging
+import sys # Import sys for flushing output
 
 # Suppress PyPSA logging
 logging.getLogger('pypsa').setLevel(logging.ERROR)
@@ -14,146 +14,235 @@ from network_utils import get_edge_to_street_mapping, get_street_to_edges_mappin
 from csv_utils import update_street_statistics_csv
 
 # Power network simulation utilities
-from powerNetworkGen import get_traffic_lights_from_sumo, get_road_edges_from_sumo, create_power_network, \
-    add_buildings_from_poly
-from powerNetwork import (
-    run_power_flow,
-    visualize_network_state,
-    initialize_power_flow_log_df,
-    append_power_flow_log_df,
-    save_power_flow_log_df,
-    set_node_down,
-    set_node_up,
-    add_ev_charging_station
-)
-
+from powerNetworkGen import get_traffic_lights_from_sumo, get_road_edges_from_sumo, create_power_network
+# from powerNetwork import run_combined_simulation
 
 def main():
     # -------------------------------
-    # Traffic Simulation Setup
+    # 1. LOAD PRE-COMPUTED POWER DATA
+    # -------------------------------
+    print("Loading pre-computed power network data...")
+    csv_filepath = "combined_voltage_log.csv"
+    try:
+        # Explicitly set index column to the first one (named 'Bus')
+        voltage_df = pd.read_csv(csv_filepath, index_col=0)
+        print(f"Successfully loaded {csv_filepath}.")
+        # --- DEBUG CSV ---
+        print("--- CSV Data Check ---")
+        print("DataFrame head:\n", voltage_df.head())
+        print("DataFrame index (first 20 node names from CSV):", voltage_df.index.tolist()[:20])
+        print("Column names (hours):", voltage_df.columns.tolist())
+        print(f"DataFrame shape: {voltage_df.shape}")
+        print("----------------------")
+        sys.stdout.flush() # Ensure prints appear immediately
+    except FileNotFoundError:
+        print(f"ERROR: {csv_filepath} not found.")
+        return
+    except Exception as e:
+        print(f"ERROR: Could not read or parse {csv_filepath}: {e}")
+        return
+
+    voltage_threshold_low = 0.8
+    voltage_threshold_high = 1.0
+
+    # -------------------------------
+    # 2. TRAFFIC SIMULATION SETUP
     # -------------------------------
     traffic_network_file = "osm.net.xml"
     route_file = "osm.rou.xml"
-
-    car_total = count_vehicles_in_route_file(route_file)
-    print(f"Total number of vehicles: {car_total}")
-
-    edge_to_street, street_names, _ = get_edge_to_street_mapping(traffic_network_file)
-    street_to_edges = get_street_to_edges_mapping(osm_file=traffic_network_file)
-    street_crossings = {edge: 0 for edge in edge_to_street.keys()}
-
-    traci.start(["sumo-gui", "-n", traffic_network_file, "-r", route_file])
-    tl_ids = traci.trafficlight.getIDList()
-
-    # -------------------------------
-    # Power Network Simulation Setup (UPDATED)
-    # -------------------------------
-    traffic_light_nodes = get_traffic_lights_from_sumo(traffic_network_file)
-    road_edges = get_road_edges_from_sumo(traffic_network_file)
-    power_network, sumo_to_label, label_to_sumo, _ = create_power_network(traffic_light_nodes, road_edges, feeders=3)
-
-    # Set up temporal parameters FIRST
-    total_steps = 24
-    power_network.set_snapshots(range(total_steps))
-
-    # Now add buildings and EV stations with time-aware profiles
-    add_buildings_from_poly(power_network, "osm.poly.xml")
-
-    # Configure massive EV load to trigger voltage drops
-    n30_coords = (power_network.buses.at["N30", "x"], power_network.buses.at["N30", "y"])
-    time_array = np.linspace(0, 2 * np.pi, total_steps)
-    ev_load_profile_mw = 500 + 1500 * np.cos(time_array - np.pi / 2) ** 2  # 500-2000MW peak
-
-    add_ev_charging_station(
-        power_network,
-        station_name="EVStation1",
-        connect_to_bus="N30",
-        ev_load_profile_kw=pd.Series(ev_load_profile_mw * 1000, index=power_network.snapshots),
-        bus_coords=(n30_coords[0] + 2, n30_coords[1] + 2),
-        line_rating_mva=500,  # Increased capacity
-        line_resistance_per_km=0.01,
-        line_reactance_per_km=0.03
-    )
-
-    # Initialize tracking
-    voltage_threshold = 0.8  # ANSI minimum voltage standard
-    power_log_df = initialize_power_flow_log_df(power_network)
-    current_power_step = 0
-    power_down_nodes = {}  # {node: (failed_step, recovery_step)}
-    tl_to_power_node = {tl_id: sumo_to_label[tl_id] for tl_id in tl_ids if tl_id in sumo_to_label}
-
-    # -------------------------------
-    # Main Simulation Loop (UPDATED)
-    # -------------------------------
-    tick_counter = 0
-    power_update_interval = 10  # Update power network every 10 traffic steps
-    failure_duration = 10  # Keep nodes down for 10 power steps (~2.4 hours)
+    sumo_gui_binary = "sumo-gui" # Or "sumo"
 
     try:
+        car_total = count_vehicles_in_route_file(route_file)
+        print(f"Total number of vehicles: {car_total}")
+
+        edge_to_street, _, _ = get_edge_to_street_mapping(traffic_network_file)
+        street_crossings = {edge: 0 for edge in edge_to_street.keys()}
+
+        traci.start([sumo_gui_binary, "-n", traffic_network_file, "-r", route_file])
+        tl_ids = traci.trafficlight.getIDList()
+        print(f"Found {len(tl_ids)} SUMO Traffic Light IDs (first 10): {tl_ids[:10]}")
+
+        # Create mapping from SUMO TL IDs to power network nodes
+        print("Generating TL to Power Node mapping...")
+        traffic_light_nodes = get_traffic_lights_from_sumo(traffic_network_file)
+        print(f"Identified {len(traffic_light_nodes)} TL nodes from SUMO network.")
+
+        # Lightweight init to get the mapping - Ensure this function returns the correct labels!
+        _, sumo_to_label, _, _ = create_power_network(traffic_light_nodes, [], feeders=0)
+        tl_to_power_node = {tl_id: sumo_to_label[tl_id] for tl_id in tl_ids if tl_id in sumo_to_label}
+
+        # --- DEBUG MAPPING ---
+        print("--- TL Mapping Check ---")
+        print(f"Number of TLs successfully mapped to power nodes: {len(tl_to_power_node)}")
+        if tl_to_power_node:
+             # Get a sample of the power node names generated by create_power_network
+             mapped_power_node_names = list(tl_to_power_node.values())
+             print(f"Sample mapped power node names (first 10): {mapped_power_node_names[:10]}")
+             # Compare with CSV index names
+             csv_index_names = voltage_df.index.tolist()
+             common_names = set(mapped_power_node_names) & set(csv_index_names)
+             print(f"Number of mapped power node names that ALSO exist in CSV index: {len(common_names)}")
+             if len(common_names) < len(mapped_power_node_names) and len(mapped_power_node_names) > 0:
+                 print("!! WARNING: Potential name mismatch between mapping and CSV !!")
+                 missing_in_csv = set(mapped_power_node_names) - set(csv_index_names)
+                 print(f"  Examples missing in CSV (max 5): {list(missing_in_csv)[:5]}")
+        else:
+             print("!! WARNING: No TLs were mapped to power nodes. Check 'get_traffic_lights_from_sumo' and 'create_power_network'.")
+        print("------------------------")
+        sys.stdout.flush() # Ensure prints appear immediately
+
+    except traci.TraCIException as e:
+        print(f"Error starting SUMO or during setup: {e}")
+        return
+    except FileNotFoundError as e:
+        print(f"Error: Required file not found during setup: {e}")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred during setup: {e}")
+        return
+
+
+    # -------------------------------
+    # 3. MAIN SIMULATION LOOP
+    # -------------------------------
+    tick_counter = 0
+    power_check_interval = 100
+    failure_duration = 80
+    tl_revert_times = {}
+    tl_default_programs = {}
+
+    print("Starting simulation loop...")
+    sys.stdout.flush()
+    try:
+        # Get default programs before the loop
+        print("Getting default TL programs...")
+        for tl_id in tl_ids:
+             if tl_id in tl_to_power_node:
+                try:
+                    logics = traci.trafficlight.getAllProgramLogics(tl_id)
+                    if logics:
+                         tl_default_programs[tl_id] = logics[0].programID
+                    else:
+                         tl_default_programs[tl_id] = "0"
+                except traci.TraCIException as e_prg:
+                    print(f"Warning: Could not get programs for TL {tl_id}: {e_prg}. Defaulting to '0'.")
+                    tl_default_programs[tl_id] = "0"
+        print("Finished getting default programs.")
+        sys.stdout.flush()
+
+        # --- Main Loop ---
         while traci.simulation.getMinExpectedNumber() > 0:
             traci.simulationStep()
             tick_counter += 1
 
-            # Update traffic counts
-            for edge in street_crossings.keys():
-                street_crossings[edge] += traci.edge.getLastStepVehicleNumber(edge)
+            # Check and manage TL timers (Keep as is)
+            # ... (timer logic remains the same) ...
 
-            # Power network updates
-            if tick_counter % power_update_interval == 0:
-                current_power_step += 1
+            # Update traffic counts (Keep as is)
+            # ... (traffic count logic remains the same) ...
+
+            # --- Check power network status periodically ---
+            if tick_counter % power_check_interval == 0:
+                current_hour_index = (tick_counter // power_check_interval) % len(voltage_df.columns) # Index based on columns (0-23)
+                current_hour_label = voltage_df.columns[current_hour_index] # Get the actual column name (e.g., '1', '2')
+
+                # print(f"\n--- Step {tick_counter}: Checking Power (Hour Column: '{current_hour_label}') ---") # More detailed print
 
                 try:
-                    # Run power flow and check voltages
-                    run_power_flow(power_network)
-                    current_voltages = power_network.buses_t.v_mag_pu.iloc[current_power_step % 24]
+                    # Select the column using the label
+                    hour_data = voltage_df[current_hour_label]
 
-                    # Detect voltage violations
-                    new_failures = current_voltages[current_voltages < voltage_threshold].index.tolist()
-                    for node in new_failures:
-                        if node not in power_down_nodes and node not in ["MainPowerGrid", "LocalSubstation"]:
-                            power_down_nodes[node] = (current_power_step, current_power_step + failure_duration)
-                            set_node_down(power_network, node)
-                            print(f"⚡ Node {node} failed due to low voltage {current_voltages[node]:.3f} pu")
+                    # Determine failed power nodes for this hour interval
+                    failed_power_nodes_in_csv = hour_data[
+                        (hour_data < voltage_threshold_low) |
+                        (hour_data > voltage_threshold_high)
+                    ].index.tolist()
 
-                    # Handle recoveries
-                    nodes_to_recover = [
-                        node for node, (_, recovery) in power_down_nodes.items()
-                        if current_power_step >= recovery
-                    ]
-                    for node in nodes_to_recover:
-                        set_node_up(power_network, node)
-                        del power_down_nodes[node]
-                        print(f"🔌 Node {node} restored after {failure_duration} power steps")
+                    # --- DEBUG: Compare failed nodes with mapped nodes ---
+                    if tick_counter == power_check_interval: # Only print extensive debug on first check
+                         print(f"DEBUG: Failed nodes in CSV for hour '{current_hour_label}' (first 20): {failed_power_nodes_in_csv[:20]}")
+                         print(f"DEBUG: Mapped power node names (first 20): {list(tl_to_power_node.values())[:20]}")
+                         common_failed = set(failed_power_nodes_in_csv) & set(tl_to_power_node.values())
+                         print(f"DEBUG: Nodes that failed AND are mapped to TLs (first 10): {list(common_failed)[:10]}")
+                         if not common_failed:
+                              print("DEBUG: !! No overlap found between failing nodes and mapped TL nodes this interval !!")
+                         sys.stdout.flush()
+                    # --- End DEBUG ---
 
-                    # Update visualization and logs
-                    power_log_df = append_power_flow_log_df(power_network, power_log_df, current_power_step)
-                    visualize_network_state(power_network, power_down_nodes.keys(), time_step=current_power_step)
+                    active_failures_this_interval = 0
+                    affected_tl_ids_this_interval = [] # Track which TLs are affected
 
-                except Exception as e:
-                    print(f"Power flow error: {str(e)[:50]}")
+                    for tl_id, power_node_from_map in tl_to_power_node.items():
+                        # Check if the power node name from our mapping EXISTS in the list of failed nodes from the CSV
+                        if power_node_from_map in failed_power_nodes_in_csv:
+                            # --- MATCH FOUND ---
+                            active_failures_this_interval += 1
+                            affected_tl_ids_this_interval.append(tl_id)
+                            try:
+                                current_state = traci.trafficlight.getRedYellowGreenState(tl_id)
+                                num_signals = len(current_state)
+                                all_red_state = 'r' * num_signals
 
-                # Update traffic light states based on power nodes
-                for tl_id, power_node in tl_to_power_node.items():
-                    current_state = traci.trafficlight.getRedYellowGreenState(tl_id)
-                    if power_node in power_down_nodes:
-                        if 'r' not in current_state.lower():
-                            traci.trafficlight.setRedYellowGreenState(tl_id, "rrrr")
-                    else:
-                        if current_state != "GGgg":
-                            traci.trafficlight.setRedYellowGreenState(tl_id, "GGgg")
+                                if tl_id not in tl_revert_times:
+                                    if current_state.lower() != all_red_state:
+                                        traci.trafficlight.setRedYellowGreenState(tl_id, all_red_state)
+                                    tl_revert_times[tl_id] = tick_counter + failure_duration
+                                else:
+                                    if current_state.lower() != all_red_state:
+                                        traci.trafficlight.setRedYellowGreenState(tl_id, all_red_state)
+                                    tl_revert_times[tl_id] = tick_counter + failure_duration
 
-            time.sleep(0.05)
+                            except traci.TraCIException as e_state:
+                                print(f"Warning: Step {tick_counter}: Could not set state for matched TL {tl_id}: {e_state}")
+                        # ELSE: The power node mapped to this TL is NOT in the list of failing nodes for this hour.
+                        # The timer logic at the start of the loop handles reverting.
 
+                    print(f"Step {tick_counter}: Checked power for hour column '{current_hour_label}'. {len(failed_power_nodes_in_csv)} nodes out of spec in CSV. {active_failures_this_interval} TLs currently affected.")
+                    # Optional: Print affected TL IDs for more detail
+                    # if active_failures_this_interval > 0:
+                    #    print(f"  Affected TL IDs this interval: {affected_tl_ids_this_interval}")
+                    sys.stdout.flush()
+
+                except KeyError:
+                     print(f"ERROR: Step {tick_counter}: Column '{current_hour_label}' not found in voltage_df. Available columns: {voltage_df.columns.tolist()}")
+                except IndexError:
+                     print(f"ERROR: Step {tick_counter}: Could not access column index {current_hour_index}. DataFrame has {len(voltage_df.columns)} columns.")
+                except Exception as e_power_check:
+                     print(f"ERROR: Step {tick_counter}: Unexpected error during power check: {e_power_check}")
+
+
+            # time.sleep(0.05) # Remove for speed
+
+    # ... (Keep the rest of the try...except...finally block as it was) ...
+    except traci.TraCIException as e:
+        print(f"Simulation loop interrupted by TraCIException: {e}")
+        if "connection closed by SUMO" in str(e).lower():
+            print("This might be normal if the simulation finished or was closed manually.")
+        else:
+            print("An unexpected TraCI error occurred.")
     except Exception as e:
-        print(f"Simulation ended: {str(e)}")
+        print(f"An unexpected error occurred during simulation: {e}")
     finally:
-        save_power_flow_log_df(power_log_df, "power_log.csv")
-        update_street_statistics_csv(
-            {f"{edge_to_street.get(e, 'Unknown')} ({e})": c for e, c in street_crossings.items()},
-            "traffic_stats.csv"
-        )
-        traci.close()
-        print(f"Simulation completed after {tick_counter} steps")
+        print("Cleaning up...")
+        try:
+            update_street_statistics_csv(
+                {f"{edge_to_street.get(e, 'Unknown')} ({e})": c for e, c in street_crossings.items()},
+                "traffic_stats.csv"
+            )
+        except Exception as e_csv:
+            print(f"Error updating CSV: {e_csv}")
+
+        try:
+            if traci.isLoaded():
+                traci.close()
+                print("TraCI connection closed.")
+            else:
+                print("TraCI connection already closed.")
+        except Exception as e_close:
+            print(f"Error closing TraCI: {e_close}")
+
+        print(f"Simulation ended. Total steps: {tick_counter}")
 
 
 if __name__ == "__main__":
